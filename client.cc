@@ -30,8 +30,7 @@ int main(int argc, char **argv) {
 
   MsgQueueHandle qh;
 
-  conn.prep_rpc_send_defer(qh, 1, 0, sizeof(p_data_t));
-  conn.prep_rpc_send_confirm();
+  conn.prep_rpc_send(qh, 1, nullptr, 0, sizeof(p_data_t));
   uint64_t t = conn.submit(qh);
 
   cout << "send msg ok" << endl;
@@ -89,9 +88,9 @@ int main(int argc, char **argv) {
         int *p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
         *p = i;
         conn.prep_rpc_send_confirm();
-        // p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
-        // *p = i + 1;
-        // conn.prep_rpc_send_confirm();
+        p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
+        *p = i + 1;
+        conn.prep_rpc_send_confirm();
         uint64_t t = conn.submit(qh);
         std::vector<const void *> resp_data_ptr;
         int rc = conn.remote_task_wait(t, resp_data_ptr);

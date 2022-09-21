@@ -112,7 +112,7 @@ struct RDMAConnection {
                uint64_t remote_addr, uint32_t rkey, uint64_t expected,
                uint64_t desired);
   int prep_rpc_send(MsgQueueHandle &qh, uint8_t rpc_op, const void *param_data,
-                    uint32_t length);
+                    uint32_t param_data_length, uint32_t resp_data_length);
   /**
    * 准备rpc发送，返回消息buffer指针
    * 在remote_task轮询成功时自动回收

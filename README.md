@@ -1,4 +1,4 @@
-A Easy RPC Tool based on RDMA CM
+An Easy RPC Tool based on RDMA CM
 ---
 
 example file: server.cc client.cc

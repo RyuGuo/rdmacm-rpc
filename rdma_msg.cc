@@ -419,16 +419,19 @@ int RDMAConnection::prep_cas(MsgQueueHandle &qh, uint64_t local_addr,
 }
 
 int RDMAConnection::prep_rpc_send(MsgQueueHandle &qh, uint8_t rpc_op,
-                                  const void *param_data, uint32_t length) {
+                                  const void *param_data,
+                                  uint32_t param_data_length,
+                                  uint32_t resp_data_length) {
   void *msg_buf =
-      prep_rpc_send_defer(qh, rpc_op, length, m_rpc_exec_map_[rpc_op].second);
+      prep_rpc_send_defer(qh, rpc_op, param_data_length, resp_data_length);
 
   if (__glibc_unlikely(!msg_buf)) {
     return -1;
   }
 
-  memcpy(msg_buf, param_data, length);
+  memcpy(msg_buf, param_data, param_data_length);
 
+  prep_rpc_send_confirm();
   return 0;
 }
 
