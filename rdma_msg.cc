@@ -16,6 +16,18 @@
 #include <thread>
 #include <unistd.h>
 
+struct sync_data_t {
+  volatile bool wc_finish;
+  bool timeout;
+  uint32_t inflight;
+  uint32_t now_ms;
+  size_t resp_poll_idx;
+  RDMAConnection *conn;
+  std::vector<uint32_t> msg_offsets;
+  std::vector<MsgBlock *> resp_mbs;
+  std::vector<const void *> resp_data_ptr;
+};
+
 std::unordered_map<
     uint8_t,
     std::pair<std::function<void(RDMAConnection *conn, const void *msg_data,
@@ -140,18 +152,18 @@ void dealloc_buf_ptr(T ptr, std::atomic<T> &left_half_cnt,
   }
 }
 
-// 重用sync_data_t
-static thread_local std::vector<RDMAConnection::sync_data_t *> sd_pool;
-RDMAConnection::sync_data_t *RDMAConnection::alloc_sync_data() {
+// 重用sync_data_t的池
+static thread_local std::vector<sync_data_t *> sd_pool;
+sync_data_t *alloc_sync_data() {
   if (sd_pool.empty()) {
-    return new RDMAConnection::sync_data_t();
+    return new sync_data_t();
   } else {
-    RDMAConnection::sync_data_t *sd = sd_pool.back();
+    sync_data_t *sd = sd_pool.back();
     sd_pool.pop_back();
     return sd;
   }
 }
-void RDMAConnection::dealloc_sync_data(RDMAConnection::sync_data_t *sd) {
+void dealloc_sync_data(sync_data_t *sd) {
   sd->msg_offsets.clear();
   sd->resp_mbs.clear();
   sd->resp_data_ptr.clear();
@@ -177,79 +189,108 @@ void RDMAConnection::register_rpc_func(
           resp_max_size));
 }
 
-void RDMAConnection::msg_recv_work() {
-  std::deque<uint64_t> hdls;
-  std::vector<const void *> resp_tmp;
-  uint16_t msg_size;
-  MsgQueueHandle recver_qh;
+RDMAMsgPollThread::RDMAMsgPollThread() : stop_(false) {
+  th_ = std::thread(&RDMAMsgPollThread::thread_routine, this);
+}
+RDMAMsgPollThread::~RDMAMsgPollThread() {
+  stop_ = true;
+  th_.join();
+}
+void RDMAMsgPollThread::join_recver_conn(RDMAConnection *conn) {
+  set_lck_.lock();
+  conn_set_.push_back(std::make_pair(conn, ConnContext()));
+  set_lck_.unlock();
+}
+void RDMAMsgPollThread::exit_recver_conn(RDMAConnection *conn) {
+  set_lck_.lock();
+  // 这里conn set采用数组，以减少轮询时的cache miss
+  // conn退出时时间复杂度较高，但可忽略
+  for (auto it = conn_set_.begin(); it != conn_set_.end(); ++it) {
+    conn_set_.erase(it);
+    break;
+  }
+  set_lck_.unlock();
+}
+void RDMAMsgPollThread::thread_routine() {
+  while (!stop_) {
+    set_lck_.lock();
+    for (auto &p : conn_set_) {
+      RDMAConnection *conn = p.first;
+      ConnContext &ctx = p.second;
 
-  // printf("try poll %p\n", (char *)recver.m_msg_buf_->addr);
+      auto &recver = conn->recver;
+      auto &m_rpc_exec_map_ = conn->m_rpc_exec_map_;
 
-  while (!m_stop_) {
-    MsgBlock *msg_mb =
-        (MsgBlock *)((char *)recver.m_msg_buf_->addr + recver.m_msg_head_);
-    // 1. 轮询当前msg_buf的指针指向的mb是否完成
-    if (msg_mb->valid()) {
-      // printf("poll %p\n", msg_mb);
-      msg_size = msg_mb->msg_size();
+      std::deque<uint64_t> &hdls = ctx.hdls;
+      std::vector<const void *> &resp_tmp = ctx.resp_tmp;
+      MsgQueueHandle &recver_qh = ctx.recver_qh;
 
-      // 如果是nop，将轮询指针回环到头
-      if (msg_mb->rpc_op == 0) {
-        recver.m_msg_head_ = 0;
-        continue;
+      MsgBlock *msg_mb =
+          (MsgBlock *)((char *)recver.m_msg_buf_->addr + recver.m_msg_head_);
+      // 1. 轮询当前msg_buf的指针指向的mb是否完成
+      if (msg_mb->valid()) {
+        // printf("poll %p %p\n",conn, msg_mb);
+        uint16_t msg_size = msg_mb->msg_size();
+
+        // 如果是nop，将轮询指针回环到头
+        if (msg_mb->rpc_op == 0) {
+          recver.m_msg_head_ = 0;
+          continue;
+        }
+
+        // 2. 为消息返回申请resp_buf
+        MsgBlock *resp_mb = (MsgBlock *)((char *)recver.m_resp_buf_->addr +
+                                         msg_mb->resp_offset);
+        resp_mb->notify = 1;
+        resp_mb->size = m_rpc_exec_map_[msg_mb->rpc_op].second;
+        resp_mb->set_complete_byte();
+
+        // 3. 执行处理函数
+        m_rpc_exec_map_[msg_mb->rpc_op].first(conn, msg_mb->data, msg_mb->size,
+                                              resp_mb->data);
+
+        // printf("send resp: %#lx %u\n",
+        //        recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
+        //        resp_mb->msg_size());
+
+        // 4. 发送返回
+        conn->prep_write(recver_qh, (uintptr_t)resp_mb,
+                         recver.m_resp_buf_->lkey, resp_mb->msg_size(),
+                         recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
+                         recver.m_peer_resp_buf_rkey_);
+
+        // batch 返回
+        if (msg_mb->last_end) {
+          uint64_t hdl = conn->submit(recver_qh);
+          hdls.push_back(hdl);
+        }
+
+        // 5. 清空消息buf
+        memset(msg_mb, 0, msg_size);
+
+        // 6. 推进轮询msg_buf指针
+        const uint32_t msg_head = recver.m_msg_head_;
+        uint32_t msg_head_next;
+        if (RDMAConnection::MAX_MESSAGE_BUFFER_SIZE - msg_head - msg_size <
+            MsgBlock::msg_min_size()) {
+          msg_head_next = 0;
+        } else {
+          msg_head_next = msg_head + msg_size;
+        }
+        recver.m_msg_head_ = msg_head_next;
+
+        // printf("try poll %p\n",
+        //        (char *)recver.m_msg_buf_->addr + recver.m_msg_head_.load());
       }
-
-      // 2. 为消息返回申请resp_buf
-      MsgBlock *resp_mb =
-          (MsgBlock *)((char *)recver.m_resp_buf_->addr + msg_mb->resp_offset);
-      resp_mb->notify = 1;
-      resp_mb->size = m_rpc_exec_map_[msg_mb->rpc_op].second;
-      resp_mb->set_complete_byte();
-
-      // 3. 执行处理函数
-      m_rpc_exec_map_[msg_mb->rpc_op].first(this, msg_mb->data, msg_mb->size,
-                                            resp_mb->data);
-
-      // printf("send resp: %#lx %u\n",
-      //        recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
-      //        resp_mb->msg_size());
-
-      // 4. 发送返回
-      prep_write(recver_qh, (uintptr_t)resp_mb, recver.m_resp_buf_->lkey,
-                 resp_mb->msg_size(),
-                 recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
-                 recver.m_peer_resp_buf_rkey_);
-
-      // batch 返回
-      if (msg_mb->last_end) {
-        uint64_t hdl = submit(recver_qh);
-        hdls.push_back(hdl);
+      // 7. 轮询返回值是否发送成功
+      if (!hdls.empty()) {
+        uint64_t hdl = hdls.front();
+        if (RDMAConnection::remote_task_try_get(hdl, resp_tmp) == 0) {
+          hdls.pop_front();
+        }
       }
-
-      // 5. 清空消息buf
-      memset(msg_mb, 0, msg_size);
-
-      // 6. 推进轮询msg_buf指针
-      const uint32_t msg_head = recver.m_msg_head_;
-      uint32_t msg_head_next;
-      if (MAX_MESSAGE_BUFFER_SIZE - msg_head - msg_size <
-          MsgBlock::msg_min_size()) {
-        msg_head_next = 0;
-      } else {
-        msg_head_next = msg_head + msg_size;
-      }
-      recver.m_msg_head_ = msg_head_next;
-
-      // printf("try poll %p\n",
-      //        (char *)recver.m_msg_buf_->addr + recver.m_msg_head_.load());
     }
-    // 7. 轮询返回值是否发送成功
-    while (!hdls.empty()) {
-      uint64_t hdl = hdls.front();
-      if (remote_task_try_get(hdl, resp_tmp) == 0) {
-        hdls.pop_front();
-      }
-    }
+    set_lck_.unlock();
     std::this_thread::yield();
   }
 }
@@ -265,7 +306,7 @@ void *RDMAConnection::prep_rpc_send_defer(MsgQueueHandle &qh, uint8_t rpc_op,
   uint32_t msg_nop_offset = 0;
   MsgBlock *msg_mb, *nop_mb, tmp;
 
-  pthread_spin_lock(&m_sending_lock_);
+  m_sending_lock_.lock();
 
   m_send_defer_cnt_.fetch_add(1, std::memory_order_acquire);
 
@@ -317,7 +358,7 @@ void *RDMAConnection::prep_rpc_send_defer(MsgQueueHandle &qh, uint8_t rpc_op,
              msg_mb->msg_size(), sender.m_peer_msg_buf_addr_ + msg_offset,
              sender.m_peer_msg_buf_rkey_);
 
-  pthread_spin_unlock(&m_sending_lock_);
+  m_sending_lock_.unlock();
 
   // 5. 清空resp buf
   memset((char *)sender.m_resp_buf_->addr + resp_offset, 0, tmp.msg_size());
@@ -446,8 +487,9 @@ uint64_t RDMAConnection::submit(MsgQueueHandle &qh) {
   std::vector<ibv_sge> msg_sges;
 
   sync_data_t *sd = alloc_sync_data();
+  sd->conn = this;
 
-  pthread_spin_lock(&m_sending_lock_);
+  m_sending_lock_.lock();
 
   while (m_send_defer_cnt_.load(std::memory_order_relaxed)) {
     std::this_thread::yield();
@@ -457,7 +499,7 @@ uint64_t RDMAConnection::submit(MsgQueueHandle &qh) {
   msg_sges.swap(m_msg_qh_.sges);
   send_msg_wrs.swap(m_msg_qh_.send_wrs);
 
-  pthread_spin_unlock(&m_sending_lock_);
+  m_sending_lock_.unlock();
 
   if (!sd->msg_offsets.empty()) {
     MsgBlock *first_msg_mb =
@@ -496,11 +538,10 @@ uint64_t RDMAConnection::submit(MsgQueueHandle &qh) {
     wr_head = &send_msg_wrs.front();
     send_msg_wrs.back().next = nullptr;
   }
-  // send_wrs.back().next = nullptr;
 
   // 相邻的且addr是连续的wr进行组合
   // 一种方式实现rpc msg batch发送
-  size_t combined_wr_size = 0;
+  uint32_t combined_wr_size = 0;
   ibv_send_wr *back_wr;
   if (wr_head) {
     combined_wr_size = 1;
@@ -568,7 +609,7 @@ uint64_t RDMAConnection::submit(MsgQueueHandle &qh) {
   return wr_id;
 
 need_retry:
-  pthread_spin_lock(&m_sending_lock_);
+  m_sending_lock_.lock();
   if (m_msg_qh_.send_wrs.empty()) {
     m_msg_qh_.send_wrs.swap(send_msg_wrs);
     m_msg_qh_.sges.swap(msg_sges);
@@ -588,7 +629,7 @@ need_retry:
     m_msg_qh_.resp_mbs.insert(m_msg_qh_.resp_mbs.end(), sd->resp_mbs.begin(),
                               sd->resp_mbs.end());
   }
-  pthread_spin_unlock(&m_sending_lock_);
+  m_sending_lock_.unlock();
 
   dealloc_sync_data(sd);
 
@@ -600,13 +641,15 @@ int RDMAConnection::acknowledge_cqe(int rc, ibv_wc wcs[]) {
     auto &wc = wcs[i];
 
     sync_data_t *sd = reinterpret_cast<sync_data_t *>(wc.wr_id);
-    m_inflight_count_.fetch_sub(sd->inflight, std::memory_order_release);
+    sd->conn->m_inflight_count_.fetch_sub(sd->inflight,
+                                          std::memory_order_release);
 
     if (__glibc_likely(!sd->timeout)) {
       sd->wc_finish = true;
     } else {
       // ! 如果超时了，resp_buf本应该释放，但是remote仍可能发送，并造成污染
       for (size_t j = 0; j < sd->resp_mbs.size(); ++j) {
+        auto &sender = sd->conn->sender;
         auto &msg_offset = sd->msg_offsets[j];
         MsgBlock *msg_mb =
             (MsgBlock *)((char *)sender.m_msg_buf_->addr + msg_offset);
@@ -638,14 +681,14 @@ int RDMAConnection::acknowledge_cqe(int rc, ibv_wc wcs[]) {
 int RDMAConnection::remote_task_try_get(
     uint64_t task_id, std::vector<const void *> &resp_data_ptr) {
   struct ibv_wc wcs[POLL_ENTRY_COUNT];
-  sync_data_t *l_sd = reinterpret_cast<sync_data_t *>(task_id);
+  sync_data_t *sd = reinterpret_cast<sync_data_t *>(task_id);
 
-  if (__glibc_unlikely(l_sd->timeout)) {
+  if (__glibc_unlikely(sd->timeout)) {
     perror("rdma task timeout");
     return -1;
   }
 
-  int rc = ibv_poll_cq(m_cq_, POLL_ENTRY_COUNT, wcs);
+  int rc = ibv_poll_cq(sd->conn->m_cq_, POLL_ENTRY_COUNT, wcs);
   if (__glibc_unlikely(rc < 0)) {
     perror("ibv_poll_cq fail");
     return -1;
@@ -657,17 +700,17 @@ int RDMAConnection::remote_task_try_get(
   }
 
   // 轮询resp
-  if (try_poll_resp(l_sd) == 0 && l_sd->wc_finish) {
-    resp_data_ptr.swap(l_sd->resp_data_ptr);
-    dealloc_sync_data(l_sd);
+  if (try_poll_resp(sd) == 0 && sd->wc_finish) {
+    resp_data_ptr.swap(sd->resp_data_ptr);
+    dealloc_sync_data(sd);
     return 0;
   }
 
   // 超时检测
   uint32_t now = get_wall_time<std::chrono::milliseconds>();
 
-  if (now - l_sd->now_ms > RDMA_TIMEOUT_MS) {
-    l_sd->timeout = true;
+  if (now - sd->now_ms > RDMA_TIMEOUT_MS) {
+    sd->timeout = true;
     perror("rdma task timeout");
     return -1;
   }
@@ -691,9 +734,10 @@ int RDMAConnection::try_poll_resp(sync_data_t *sd) {
       sd->resp_data_ptr.push_back(resp_mb->data);
     } else {
       sd->resp_data_ptr.push_back(nullptr);
-      dealloc_resp_data(resp_mb->data);
+      sd->conn->dealloc_resp_data(resp_mb->data);
     }
     // 释放msg_buf
+    auto &sender = sd->conn->sender;
     MsgBlock *msg_mb =
         (MsgBlock *)((char *)sender.m_msg_buf_->addr + msg_offset);
     memset(msg_mb, 0, msg_mb->msg_size());

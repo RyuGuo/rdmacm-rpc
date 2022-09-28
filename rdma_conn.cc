@@ -12,9 +12,16 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <rdma/rdma_cma.h>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unistd.h>
+
+struct conn_param_t {
+  uint64_t addr;
+  uint32_t rkey;
+  bool rpc_conn;
+};
 
 bool RDMAConnection::rdma_conn_param_valid() {
   ibv_device_attr device_attr;
@@ -73,21 +80,95 @@ RDMAEnv::~RDMAEnv() {
   rdma_destroy_event_channel(m_cm_channel_);
 }
 
-RDMAConnection::RDMAConnection(bool rpc_conn)
-    : m_stop_(false), m_rpc_conn_(rpc_conn), m_cm_id_(nullptr), m_pd_(nullptr),
-      m_conn_handler_(nullptr), m_send_defer_cnt_(0) {
-  pthread_spin_init(&m_sending_lock_, PTHREAD_PROCESS_PRIVATE);
+CQHandle::~CQHandle() {
+  for (auto &p : cq_map_) {
+    ibv_destroy_cq(p.second);
+  }
 }
+
+RDMAConnection::RDMAConnection(CQHandle *cq_handle, bool rpc_conn)
+    : m_stop_(false), m_rpc_conn_(rpc_conn), m_cm_id_(nullptr), m_pd_(nullptr),
+      m_cq_handle_(cq_handle), m_conn_handler_(nullptr), m_send_defer_cnt_(0) {}
 RDMAConnection::~RDMAConnection() {
   m_stop_ = true;
   if (m_conn_handler_) {
     m_conn_handler_->join();
-    for (auto &conn : m_srv_conns_) {
-      delete conn;
+  } else {
+    rdma_disconnect(m_cm_id_);
+    rdma_destroy_qp(m_cm_id_);
+    if (!m_cq_handle_) {
+      ibv_destroy_cq(m_cq_);
     }
+    ibv_destroy_comp_channel(m_comp_chan_);
+    ibv_dereg_mr(sender.m_msg_buf_);
+    ibv_dereg_mr(sender.m_resp_buf_);
+    free(sender.m_msg_buf_->addr);
+    free(sender.m_resp_buf_->addr);
   }
   rdma_destroy_id(m_cm_id_);
-  pthread_spin_destroy(&m_sending_lock_);
+}
+
+int RDMAConnection::create_ibv_connection() {
+  if (!rdma_conn_param_valid()) {
+    perror("rdma_conn_param_valid fail");
+    return -1;
+  }
+
+  m_pd_ = RDMAEnv::get_instance().m_pd_map_[m_cm_id_->verbs];
+  if (!m_pd_) {
+    perror("ibv_alloc_pd fail");
+    return -1;
+  }
+
+  m_comp_chan_ = ibv_create_comp_channel(m_cm_id_->verbs);
+  if (!m_comp_chan_) {
+    perror("ibv_create_comp_channel fail");
+    return -1;
+  }
+
+  auto create_cq_fn = [verbs = m_cm_id_->verbs,
+                       m_comp_chan_ = this->m_comp_chan_]() -> ibv_cq * {
+    ibv_cq *cq = ibv_create_cq(verbs, CQE_NUM, nullptr, m_comp_chan_, 0);
+    if (!cq) {
+      perror("ibv_create_cq fail");
+      return nullptr;
+    }
+
+    if (ibv_req_notify_cq(cq, 0)) {
+      perror("ibv_req_notify_cq fail");
+      return nullptr;
+    }
+    return cq;
+  };
+
+  if (m_cq_handle_) {
+    m_cq_handle_->cq_lck_.lock();
+    auto it = m_cq_handle_->cq_map_.find(m_cm_id_->verbs);
+    if (it == m_cq_handle_->cq_map_.end()) {
+      it = m_cq_handle_->cq_map_.emplace(m_cm_id_->verbs, create_cq_fn()).first;
+    }
+    m_cq_ = it->second;
+    m_cq_handle_->cq_lck_.unlock();
+  } else {
+    m_cq_ = create_cq_fn();
+  }
+
+  ibv_qp_init_attr qp_attr = {};
+  qp_attr.qp_type = IBV_QPT_RC;
+  qp_attr.cap.max_send_wr = MAX_SEND_WR;
+  qp_attr.cap.max_send_sge = MAX_SEND_SGE;
+  qp_attr.cap.max_recv_wr = MAX_RECV_WR;
+  qp_attr.cap.max_recv_sge = MAX_RECV_SGE;
+  qp_attr.cap.max_inline_data = MSG_INLINE_THRESHOLD;
+  qp_attr.send_cq = m_cq_;
+  qp_attr.recv_cq = m_cq_;
+
+  if (rdma_create_qp(m_cm_id_, m_pd_, &qp_attr)) {
+    perror("rdma_create_qp fail");
+    return -1;
+  }
+
+  return 0;
 }
 
 int RDMAConnection::listen(const std::string &ip, uint16_t port) {
@@ -171,7 +252,7 @@ int RDMAConnection::connect(const std::string &ip, uint16_t port) {
 
   if (rdma_get_cm_event(m_cm_channel_, &event)) {
     perror("rdma_get_cm_event fail");
-    return 1;
+    return -1;
   }
 
   if (event->event != RDMA_CM_EVENT_ROUTE_RESOLVED) {
@@ -181,46 +262,7 @@ int RDMAConnection::connect(const std::string &ip, uint16_t port) {
 
   rdma_ack_cm_event(event);
 
-  if (!rdma_conn_param_valid()) {
-    perror("rdma_conn_param_valid fail");
-    return -1;
-  }
-
-  m_pd_ = RDMAEnv::get_instance().m_pd_map_[m_cm_id_->verbs];
-  if (!m_pd_) {
-    perror("ibv_alloc_pd fail");
-    return -1;
-  }
-
-  ibv_comp_channel *comp_chan = ibv_create_comp_channel(m_cm_id_->verbs);
-  if (!comp_chan) {
-    perror("ibv_create_comp_channel fail");
-    return -1;
-  }
-
-  m_cq_ = ibv_create_cq(m_cm_id_->verbs, CQE_NUM, NULL, comp_chan, 0);
-  if (!m_cq_) {
-    perror("ibv_create_cq fail");
-    return -1;
-  }
-
-  if (ibv_req_notify_cq(m_cq_, 0)) {
-    perror("ibv_req_notify_cq fail");
-    return -1;
-  }
-
-  ibv_qp_init_attr qp_attr = {};
-  qp_attr.qp_type = IBV_QPT_RC;
-  qp_attr.cap.max_send_wr = MAX_SEND_WR;
-  qp_attr.cap.max_send_sge = MAX_SEND_SGE;
-  qp_attr.cap.max_recv_wr = MAX_RECV_WR;
-  qp_attr.cap.max_recv_sge = MAX_RECV_SGE;
-  qp_attr.cap.max_inline_data = MSG_INLINE_THRESHOLD;
-  qp_attr.send_cq = m_cq_;
-  qp_attr.recv_cq = m_cq_;
-
-  if (rdma_create_qp(m_cm_id_, m_pd_, &qp_attr)) {
-    perror("rdma_create_qp fail");
+  if (create_ibv_connection()) {
     return -1;
   }
 
@@ -275,8 +317,27 @@ int RDMAConnection::connect(const std::string &ip, uint16_t port) {
   return 0;
 }
 
+void register_recver_conn_worker(
+    std::vector<RDMAMsgPollThread *> &recver_conn_ths, rdma_thread_id_t tid,
+    RDMAConnection *conn) {
+  RDMAMsgPollThread *&rpt = recver_conn_ths[tid];
+  if (!rpt) {
+    rpt = new RDMAMsgPollThread();
+  }
+  rpt->join_recver_conn(conn);
+}
+
 void RDMAConnection::handle_connection() {
   struct rdma_cm_event *event;
+  std::set<std::pair<RDMAConnection *, rdma_thread_id_t>> srv_conns;
+  std::vector<CQHandle> cq_handles(MAX_RECVER_THREAD_COUNT);
+  std::vector<RDMAMsgPollThread *> rpt_pool(MAX_RECVER_THREAD_COUNT, nullptr);
+  // 等待加入的线程队列
+  std::vector<rdma_thread_id_t> thread_waiting_pool;
+  for (uint8_t i = MAX_RECVER_THREAD_COUNT; i > 0; --i) {
+    thread_waiting_pool.push_back(i - 1);
+  }
+
   while (!m_stop_) {
     if (rdma_get_cm_event(RDMAEnv::get_instance().m_cm_channel_, &event)) {
       perror("rdma_get_cm_event fail");
@@ -290,72 +351,67 @@ void RDMAConnection::handle_connection() {
              sizeof(resp_buf_info));
       rdma_ack_cm_event(event);
 
-      RDMAConnection *conn = new RDMAConnection(resp_buf_info.rpc_conn);
+      // 选出一个thread来进行poll msg
+      rdma_thread_id_t tid = thread_waiting_pool.back();
+      thread_waiting_pool.pop_back();
+      // 如果waiting poll为空，则填充
+      if (thread_waiting_pool.empty()) {
+        for (uint8_t i = MAX_RECVER_THREAD_COUNT; i > 0; --i) {
+          thread_waiting_pool.push_back(i - 1);
+        }
+      }
+
+      RDMAConnection *conn =
+          new RDMAConnection(&cq_handles[tid], resp_buf_info.rpc_conn);
       conn->m_cm_id_ = cm_id;
       conn->recver.m_peer_resp_buf_addr_ = resp_buf_info.addr;
       conn->recver.m_peer_resp_buf_rkey_ = resp_buf_info.rkey;
       conn->create_connection();
-      m_srv_conns_.push_back(conn);
+      srv_conns.emplace(conn, tid);
+      register_recver_conn_worker(rpt_pool, tid, conn);
+
+      printf("get event: %s\n", rdma_event_str(event->event));
+
     } else if (event->event == RDMA_CM_EVENT_ESTABLISHED) {
       rdma_ack_cm_event(event);
     } else {
+      struct rdma_cm_id *cm_id = event->id;
       rdma_ack_cm_event(event);
+
+      for (auto it = srv_conns.begin(); it != srv_conns.end(); ++it) {
+        if (it->first->m_cm_id_ == cm_id) {
+          thread_waiting_pool.push_back(it->second);
+          rpt_pool[it->second]->exit_recver_conn(it->first);
+          delete it->first;
+          srv_conns.erase(it);
+          break;
+        }
+      }
+
+      printf("get event: %s\n", rdma_event_str(event->event));
     }
+  }
+
+  for (auto &rpt : rpt_pool) {
+    if (rpt) {
+      delete rpt;
+    }
+  }
+
+  for (auto &conn : srv_conns) {
+    delete conn.first;
   }
 }
 
 void RDMAConnection::create_connection() {
-  if (!rdma_conn_param_valid()) {
-    perror("rdma_conn_param_valid fail");
+  if (create_ibv_connection()) {
     return;
   }
-
-  m_pd_ = RDMAEnv::get_instance().m_pd_map_[m_cm_id_->verbs];
-  if (!m_pd_) {
-    perror("ibv_alloc_pd fail");
-    return;
-  }
-
-  ibv_comp_channel *comp_chan = ibv_create_comp_channel(m_cm_id_->verbs);
-  if (!comp_chan) {
-    perror("ibv_create_comp_channel fail");
-    return;
-  }
-
-  m_cq_ = ibv_create_cq(m_cm_id_->verbs, CQE_NUM, nullptr, comp_chan, 0);
-  if (!m_cq_) {
-    perror("ibv_create_cq fail");
-    return;
-  }
-
-  if (ibv_req_notify_cq(m_cq_, 0)) {
-    perror("ibv_req_notify_cq fail");
-    return;
-  }
-
-  ibv_qp_init_attr qp_attr = {};
-  qp_attr.qp_type = IBV_QPT_RC;
-  qp_attr.cap.max_send_wr = MAX_SEND_WR;
-  qp_attr.cap.max_send_sge = MAX_SEND_SGE;
-  qp_attr.cap.max_recv_wr = MAX_RECV_WR;
-  qp_attr.cap.max_recv_sge = MAX_RECV_SGE;
-  qp_attr.cap.max_inline_data = MSG_INLINE_THRESHOLD;
-  qp_attr.send_cq = m_cq_;
-  qp_attr.recv_cq = m_cq_;
-
-  if (rdma_create_qp(m_cm_id_, m_pd_, &qp_attr)) {
-    perror("rdma_create_qp fail");
-    return;
-  }
-
-  assert(m_cm_id_->qp);
 
   conn_param_t msg_buf_info = {};
   if (m_rpc_conn_) {
     recver.m_msg_head_ = 0;
     recver.m_resp_head_ = 0;
-    recver.m_resp_buf_left_half_cnt_ = 0;
-    recver.m_resp_buf_right_half_cnt_ = 0;
     recver.m_msg_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
     recver.m_resp_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
     memset(recver.m_msg_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
@@ -363,9 +419,6 @@ void RDMAConnection::create_connection() {
 
     msg_buf_info.addr = (uintptr_t)recver.m_msg_buf_->addr;
     msg_buf_info.rkey = recver.m_msg_buf_->rkey;
-
-    recver.m_msg_recv_worker_ =
-        new std::thread(&RDMAConnection::msg_recv_work, this);
   }
 
   rdma_conn_param conn_param = {};

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <infiniband/sa.h>
 #include <infiniband/verbs.h>
@@ -22,6 +23,16 @@
 //               L-----> pd  --> mr
 //                        L----> qp
 // 一个rdma_id对应一个qp
+
+using rdma_thread_id_t = uint8_t;
+
+struct RDMASpinLock {
+  pthread_spinlock_t spin_lck_;
+  RDMASpinLock() { pthread_spin_init(&spin_lck_, PTHREAD_PROCESS_PRIVATE); }
+  ~RDMASpinLock() { pthread_spin_destroy(&spin_lck_); }
+  int lock() { return pthread_spin_lock(&spin_lck_); }
+  int unlock() { return pthread_spin_unlock(&spin_lck_); }
+};
 
 struct RDMAEnv {
   RDMAEnv(const RDMAEnv &) = delete;
@@ -68,6 +79,13 @@ struct MsgBlock {
   }
 };
 
+struct CQHandle {
+  std::map<ibv_context *, ibv_cq *> cq_map_;
+  RDMASpinLock cq_lck_;
+  CQHandle() {}
+  ~CQHandle();
+};
+
 struct MsgQueueHandle {
   std::vector<ibv_sge> sges;
   std::vector<ibv_send_wr> send_wrs;
@@ -75,10 +93,9 @@ struct MsgQueueHandle {
   std::vector<MsgBlock *> resp_mbs;
 };
 
-struct RDMAConnection {
-  RDMAConnection(bool rpc_conn = true);
-  ~RDMAConnection();
+struct sync_data_t;
 
+struct RDMAConnection {
   constexpr static int MAX_SEND_WR = 16;
   constexpr static int MAX_RECV_WR = 1;
   constexpr static int MAX_SEND_SGE = 1;
@@ -93,6 +110,11 @@ struct RDMAConnection {
   constexpr static uint32_t RDMA_TIMEOUT_MS = 2000;
   constexpr static size_t MAX_MESSAGE_BUFFER_SIZE = 4096;
   constexpr static uint32_t MSG_INLINE_THRESHOLD = 64;
+
+  constexpr static uint8_t MAX_RECVER_THREAD_COUNT = 2;
+
+  RDMAConnection(CQHandle *cq_handle = nullptr, bool rpc_conn = true);
+  ~RDMAConnection();
 
   int listen(const std::string &ip, uint16_t port);
   int connect(const std::string &ip, uint16_t port);
@@ -136,14 +158,14 @@ struct RDMAConnection {
 
   /**
    * @return
-   *     0 - ok
-   *     1 - pending
-   *    -1 - error
+   *  *  0 - ok
+   *  *  1 - pending
+   *  * -1 - error
    */
-  int remote_task_try_get(uint64_t task_id,
-                          std::vector<const void *> &resp_data_ptr);
-  int remote_task_wait(uint64_t task_id,
-                       std::vector<const void *> &resp_data_ptr);
+  static int remote_task_try_get(uint64_t task_id,
+                                 std::vector<const void *> &resp_data_ptr);
+  static int remote_task_wait(uint64_t task_id,
+                              std::vector<const void *> &resp_data_ptr);
   void dealloc_resp_data(const void *data_ptr);
 
   static std::unordered_map<
@@ -162,33 +184,17 @@ struct RDMAConnection {
   bool m_rpc_conn_;
   bool m_atomic_support_;
   bool m_inline_support_;
+  ibv_comp_channel *m_comp_chan_;
   rdma_cm_id *m_cm_id_;
   ibv_pd *m_pd_;
   ibv_cq *m_cq_;
+  CQHandle *m_cq_handle_;
   std::thread *m_conn_handler_;
-  std::vector<RDMAConnection *> m_srv_conns_;
   std::atomic<uint32_t> m_inflight_count_ = {0};
 
-  pthread_spinlock_t m_sending_lock_;
+  RDMASpinLock m_sending_lock_;
   MsgQueueHandle m_msg_qh_;
   std::atomic<uint32_t> m_send_defer_cnt_;
-
-  struct sync_data_t {
-    volatile bool wc_finish;
-    bool timeout;
-    uint32_t inflight;
-    uint32_t now_ms;
-    size_t resp_poll_idx;
-    std::vector<uint32_t> msg_offsets;
-    std::vector<MsgBlock *> resp_mbs;
-    std::vector<const void *> resp_data_ptr;
-  };
-
-  struct conn_param_t {
-    uint64_t addr;
-    uint32_t rkey;
-    bool rpc_conn;
-  };
 
   union {
     //    sender                   // recver
@@ -225,22 +231,36 @@ struct RDMAConnection {
 
       uint64_t m_peer_resp_buf_addr_;
       uint32_t m_peer_resp_buf_rkey_;
-
-      std::atomic<uint32_t> m_resp_buf_left_half_cnt_;
-      std::atomic<uint32_t> m_resp_buf_right_half_cnt_;
-
-      std::thread *m_msg_recv_worker_;
     } recver;
   };
 
   bool rdma_conn_param_valid();
+  int create_ibv_connection();
   void handle_connection();
   void create_connection();
   void msg_recv_work();
-  int acknowledge_cqe(int rc, ibv_wc wcs[]);
-  int try_poll_resp(sync_data_t *sd);
-  sync_data_t *alloc_sync_data();
-  void dealloc_sync_data(sync_data_t *sd);
+  static int acknowledge_cqe(int rc, ibv_wc wcs[]);
+
+  static int try_poll_resp(sync_data_t *sd);
+};
+
+struct RDMAMsgPollThread {
+  struct ConnContext {
+    MsgQueueHandle recver_qh;
+    std::deque<uint64_t> hdls;
+    std::vector<const void *> resp_tmp;
+  };
+
+  volatile bool stop_;
+  RDMASpinLock set_lck_;
+  std::vector<std::pair<RDMAConnection *, ConnContext>> conn_set_;
+  std::thread th_;
+
+  RDMAMsgPollThread();
+  ~RDMAMsgPollThread();
+  void join_recver_conn(RDMAConnection *conn);
+  void exit_recver_conn(RDMAConnection *conn);
+  void thread_routine();
 };
 
 #endif // __RDMA_CONN_H__
