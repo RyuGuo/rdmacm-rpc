@@ -31,12 +31,12 @@ int main(int argc, char **argv) {
   MsgQueueHandle qh;
 
   conn.prep_rpc_send(qh, 1, nullptr, 0, sizeof(p_data_t));
-  uint64_t t = conn.submit(qh);
+  RDMAFuture t = conn.submit(qh);
 
   cout << "send msg ok" << endl;
 
   std::vector<const void *> resp_data_ptr;
-  conn.remote_task_wait(t, resp_data_ptr);
+  t.get(resp_data_ptr);
 
   cout << "get resp ok" << endl;
 
@@ -46,10 +46,10 @@ int main(int argc, char **argv) {
     *(uint64_t *)mr->addr = 0;
     conn.prep_write(qh, (uintptr_t)mr->addr, mr->lkey, 8, pdata->addr,
                     pdata->rkey);
-    uint64_t t = conn.submit(qh);
+    RDMAFuture t = conn.submit(qh);
 
     std::vector<const void *> resp_data_ptr;
-    assert(conn.remote_task_wait(t, resp_data_ptr) == 0);
+    assert(t.get(resp_data_ptr) == 0);
 
     cout << "write ok" << endl;
   }
@@ -57,10 +57,10 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 4; ++i) {
     conn.prep_fetch_add(qh, (uintptr_t)mr->addr, mr->lkey, pdata->addr,
                         pdata->rkey, 1);
-    uint64_t t = conn.submit(qh);
+    RDMAFuture t = conn.submit(qh);
 
     std::vector<const void *> resp_data_ptr;
-    assert(conn.remote_task_wait(t, resp_data_ptr) == 0);
+    assert(t.get(resp_data_ptr) == 0);
   }
 
   cout << "fetch add ok" << endl;
@@ -68,10 +68,10 @@ int main(int argc, char **argv) {
   {
     conn.prep_read(qh, (uintptr_t)mr->addr, mr->lkey, 8, pdata->addr,
                    pdata->rkey);
-    uint64_t t = conn.submit(qh);
+    RDMAFuture t = conn.submit(qh);
 
     std::vector<const void *> resp_data_ptr;
-    assert(conn.remote_task_wait(t, resp_data_ptr) == 0);
+    assert(t.get(resp_data_ptr) == 0);
     assert(*(uint64_t *)mr->addr == 4);
   }
 
@@ -91,9 +91,9 @@ int main(int argc, char **argv) {
         p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
         *p = i + 1;
         conn.prep_rpc_send_confirm();
-        uint64_t t = conn.submit(qh);
+        RDMAFuture fu = conn.submit(qh);
         std::vector<const void *> resp_data_ptr;
-        int rc = conn.remote_task_wait(t, resp_data_ptr);
+        int rc = fu.get(resp_data_ptr);
         assert(rc == 0);
         assert(resp_data_ptr.size() == 2);
         assert(*(const int *)resp_data_ptr[0] == i);

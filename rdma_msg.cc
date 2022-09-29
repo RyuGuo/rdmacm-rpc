@@ -221,7 +221,7 @@ void RDMAMsgPollThread::thread_routine() {
       auto &recver = conn->recver;
       auto &m_rpc_exec_map_ = conn->m_rpc_exec_map_;
 
-      std::deque<uint64_t> &hdls = ctx.hdls;
+      std::deque<RDMAFuture> &hdls = ctx.hdls;
       std::vector<const void *> &resp_tmp = ctx.resp_tmp;
       MsgQueueHandle &recver_qh = ctx.recver_qh;
 
@@ -229,7 +229,7 @@ void RDMAMsgPollThread::thread_routine() {
           (MsgBlock *)((char *)recver.m_msg_buf_->addr + recver.m_msg_head_);
       // 1. 轮询当前msg_buf的指针指向的mb是否完成
       if (msg_mb->valid()) {
-        // printf("poll %p %p\n",conn, msg_mb);
+        // printf("poll %p %p\n", conn, msg_mb);
         uint16_t msg_size = msg_mb->msg_size();
 
         // 如果是nop，将轮询指针回环到头
@@ -261,7 +261,7 @@ void RDMAMsgPollThread::thread_routine() {
 
         // batch 返回
         if (msg_mb->last_end) {
-          uint64_t hdl = conn->submit(recver_qh);
+          RDMAFuture hdl = conn->submit(recver_qh);
           hdls.push_back(hdl);
         }
 
@@ -284,8 +284,8 @@ void RDMAMsgPollThread::thread_routine() {
       }
       // 7. 轮询返回值是否发送成功
       if (!hdls.empty()) {
-        uint64_t hdl = hdls.front();
-        if (RDMAConnection::remote_task_try_get(hdl, resp_tmp) == 0) {
+        RDMAFuture hdl = hdls.front();
+        if (hdl.try_get(resp_tmp) == 0) {
           hdls.pop_front();
         }
       }
@@ -480,7 +480,8 @@ void RDMAConnection::prep_rpc_send_confirm() {
   m_send_defer_cnt_.fetch_sub(1, std::memory_order_release);
 }
 
-uint64_t RDMAConnection::submit(MsgQueueHandle &qh) {
+RDMAFuture RDMAConnection::submit(MsgQueueHandle &qh) {
+  RDMAFuture fu;
   std::vector<ibv_send_wr> &send_wrs = qh.send_wrs;
   std::vector<ibv_sge> &sges = qh.sges;
   std::vector<ibv_send_wr> send_msg_wrs;
@@ -548,8 +549,14 @@ uint64_t RDMAConnection::submit(MsgQueueHandle &qh) {
     back_wr = wr_head;
     for (ibv_send_wr *wri = back_wr, *wrj = wri->next; wrj != nullptr;
          wrj = wrj->next) {
-      if ((wri->opcode == wrj->opcode) &&
-          (wri->sg_list->addr + wri->sg_list->length == wrj->sg_list->addr)) {
+      if ((wrj->opcode == IBV_WR_RDMA_WRITE ||
+           wrj->opcode == IBV_WR_RDMA_READ) &&
+          (wri->opcode == wrj->opcode) &&
+          (wri->sg_list->lkey == wrj->sg_list->lkey) &&
+          (wri->sg_list->addr + wri->sg_list->length == wrj->sg_list->addr) &&
+          (wri->wr.rdma.rkey == wrj->wr.rdma.rkey) &&
+          (wri->wr.rdma.remote_addr + wri->sg_list->length ==
+           wrj->wr.rdma.remote_addr)) {
         wri->sg_list->length += wrj->sg_list->length;
         wri->next = wrj->next;
       } else {
@@ -562,11 +569,12 @@ uint64_t RDMAConnection::submit(MsgQueueHandle &qh) {
   sd->inflight = combined_wr_size;
 
   uint64_t wr_id = reinterpret_cast<uint64_t>(sd);
+  fu.sd = sd;
 
   if (combined_wr_size == 0) {
     sd->wc_finish = true;
     sd->now_ms = get_wall_time<std::chrono::milliseconds>();
-    return wr_id;
+    return fu;
   }
 
   sd->wc_finish = false;
@@ -594,6 +602,11 @@ uint64_t RDMAConnection::submit(MsgQueueHandle &qh) {
   } while (!m_inflight_count_.compare_exchange_weak(
       inflight, inflight + combined_wr_size, std::memory_order_acquire));
 
+  // for (ibv_send_wr *wp = wr_head; wp != nullptr; wp = wp->next) {
+  //   printf("send msg %#lx:%u to %#lx\n", wp->sg_list->addr, wp->sg_list->length,
+  //          wp->wr.rdma.remote_addr);
+  // }
+
   sd->now_ms = get_wall_time<std::chrono::milliseconds>();
 
   struct ibv_send_wr *bad_send_wr;
@@ -606,7 +619,7 @@ uint64_t RDMAConnection::submit(MsgQueueHandle &qh) {
   qh.send_wrs.clear();
   qh.sges.clear();
 
-  return wr_id;
+  return fu;
 
 need_retry:
   m_sending_lock_.lock();
@@ -633,7 +646,8 @@ need_retry:
 
   dealloc_sync_data(sd);
 
-  return 0;
+  fu.sd = nullptr;
+  return fu;
 }
 
 int RDMAConnection::acknowledge_cqe(int rc, ibv_wc wcs[]) {
@@ -678,29 +692,27 @@ int RDMAConnection::acknowledge_cqe(int rc, ibv_wc wcs[]) {
   return 0;
 }
 
-int RDMAConnection::remote_task_try_get(
-    uint64_t task_id, std::vector<const void *> &resp_data_ptr) {
-  struct ibv_wc wcs[POLL_ENTRY_COUNT];
-  sync_data_t *sd = reinterpret_cast<sync_data_t *>(task_id);
+int RDMAFuture::try_get(std::vector<const void *> &resp_data_ptr) {
+  struct ibv_wc wcs[RDMAConnection::POLL_ENTRY_COUNT];
 
   if (__glibc_unlikely(sd->timeout)) {
     perror("rdma task timeout");
     return -1;
   }
 
-  int rc = ibv_poll_cq(sd->conn->m_cq_, POLL_ENTRY_COUNT, wcs);
+  int rc = ibv_poll_cq(sd->conn->m_cq_, RDMAConnection::POLL_ENTRY_COUNT, wcs);
   if (__glibc_unlikely(rc < 0)) {
     perror("ibv_poll_cq fail");
     return -1;
   }
 
-  if (__glibc_unlikely(acknowledge_cqe(rc, wcs) == -1)) {
+  if (__glibc_unlikely(RDMAConnection::acknowledge_cqe(rc, wcs) == -1)) {
     perror("acknowledge_cqe fail");
     return -1;
   }
 
   // 轮询resp
-  if (try_poll_resp(sd) == 0 && sd->wc_finish) {
+  if (RDMAConnection::try_poll_resp(sd) == 0 && sd->wc_finish) {
     resp_data_ptr.swap(sd->resp_data_ptr);
     dealloc_sync_data(sd);
     return 0;
@@ -708,8 +720,7 @@ int RDMAConnection::remote_task_try_get(
 
   // 超时检测
   uint32_t now = get_wall_time<std::chrono::milliseconds>();
-
-  if (now - sd->now_ms > RDMA_TIMEOUT_MS) {
+  if (__glibc_unlikely(now - sd->now_ms > RDMAConnection::RDMA_TIMEOUT_MS)) {
     sd->timeout = true;
     perror("rdma task timeout");
     return -1;
@@ -748,10 +759,9 @@ int RDMAConnection::try_poll_resp(sync_data_t *sd) {
   return (sd->resp_poll_idx == sd->resp_mbs.size()) ? 0 : 1;
 }
 
-int RDMAConnection::remote_task_wait(uint64_t task_id,
-                                     std::vector<const void *> &resp_data_ptr) {
+int RDMAFuture::get(std::vector<const void *> &resp_data_ptr) {
   while (1) {
-    int ret = remote_task_try_get(task_id, resp_data_ptr);
+    int ret = try_get(resp_data_ptr);
     if (ret == 0) {
       return 0;
     } else if (__glibc_unlikely(ret == -1)) {
