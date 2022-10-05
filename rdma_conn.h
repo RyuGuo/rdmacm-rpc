@@ -64,7 +64,7 @@ struct MsgBlock {
   uint32_t size;
   uint16_t resp_offset;
   uint8_t rpc_op;
-  bool last_end;
+  bool not_last_end;
   volatile uint8_t notify;
   union {
     uint8_t __padding__; // 如果size=0，作为完成标记

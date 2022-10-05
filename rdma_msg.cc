@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -176,6 +177,7 @@ void RDMAConnection::register_rpc_func(
                        uint32_t size, void *resp_data)> &&rpc_func,
     uint32_t resp_max_size) {
   if (rpc_op == 0) {
+    errno = EINVAL;
     perror("rpc op can't be 0");
     return;
   }
@@ -229,7 +231,7 @@ void RDMAMsgPollThread::thread_routine() {
           (MsgBlock *)((char *)recver.m_msg_buf_->addr + recver.m_msg_head_);
       // 1. 轮询当前msg_buf的指针指向的mb是否完成
       if (msg_mb->valid()) {
-        // printf("poll %p %p\n", conn, msg_mb);
+        // printf("poll %p\n", msg_mb);
         uint16_t msg_size = msg_mb->msg_size();
 
         // 如果是nop，将轮询指针回环到头
@@ -260,7 +262,8 @@ void RDMAMsgPollThread::thread_routine() {
                          recver.m_peer_resp_buf_rkey_);
 
         // batch 返回
-        if (msg_mb->last_end) {
+        if (!msg_mb->not_last_end) {
+          // printf("send resp clear\n");
           RDMAFuture hdl = conn->submit(recver_qh);
           hdls.push_back(hdl);
         }
@@ -280,7 +283,7 @@ void RDMAMsgPollThread::thread_routine() {
         recver.m_msg_head_ = msg_head_next;
 
         // printf("try poll %p\n",
-        //        (char *)recver.m_msg_buf_->addr + recver.m_msg_head_.load());
+        //        (char *)recver.m_msg_buf_->addr + recver.m_msg_head_);
       }
       // 7. 轮询返回值是否发送成功
       if (!hdls.empty()) {
@@ -299,6 +302,7 @@ void *RDMAConnection::prep_rpc_send_defer(MsgQueueHandle &qh, uint8_t rpc_op,
                                           uint32_t param_data_length,
                                           uint32_t resp_data_length) {
   if (__glibc_unlikely(!m_rpc_conn_)) {
+    errno = EPERM;
     perror("non rpc_conn can't send rpc msg");
     return nullptr;
   }
@@ -318,7 +322,11 @@ void *RDMAConnection::prep_rpc_send_defer(MsgQueueHandle &qh, uint8_t rpc_op,
       MsgBlock::msg_min_size(), MAX_MESSAGE_BUFFER_SIZE);
 
   if (__glibc_unlikely(msg_offset == -1U)) {
+    m_send_defer_cnt_.fetch_sub(1, std::memory_order_release);
+    m_sending_lock_.unlock();
+    errno = ENOMEM;
     perror("msg buf full");
+    return nullptr;
   }
 
   // 2. 如果尾部不够，则在尾部插入一个nop操作，让recver跳过尾部再回环轮询
@@ -343,7 +351,14 @@ void *RDMAConnection::prep_rpc_send_defer(MsgQueueHandle &qh, uint8_t rpc_op,
       MsgBlock::msg_min_size(), MAX_MESSAGE_BUFFER_SIZE);
 
   if (__glibc_unlikely(resp_offset == -1U)) {
+    dealloc_buf_ptr<uint32_t>(msg_offset, sender.m_msg_buf_left_half_cnt_,
+                              sender.m_msg_buf_right_half_cnt_,
+                              MAX_MESSAGE_BUFFER_SIZE);
+    m_send_defer_cnt_.fetch_sub(1, std::memory_order_release);
+    m_sending_lock_.unlock();
+    errno = ENOMEM;
     perror("resp buf full");
+    return nullptr;
   }
 
   // 4. 发送msg
@@ -407,10 +422,12 @@ int RDMAConnection::prep_fetch_add(MsgQueueHandle &qh, uint64_t local_addr,
                                    uint32_t lkey, uint64_t remote_addr,
                                    uint32_t rkey, uint64_t n) {
   if (__glibc_unlikely(!m_atomic_support_)) {
+    errno = EPERM;
     perror("rdma fetch add: this device don't support atomic operations");
     return -1;
   }
   if (__glibc_unlikely(remote_addr % 8)) {
+    errno = EINVAL;
     perror("rdma fetch add: remote addr must be 8-byte aligned");
     return -1;
   }
@@ -435,10 +452,12 @@ int RDMAConnection::prep_cas(MsgQueueHandle &qh, uint64_t local_addr,
                              uint32_t lkey, uint64_t remote_addr, uint32_t rkey,
                              uint64_t expected, uint64_t desired) {
   if (__glibc_unlikely(!m_atomic_support_)) {
+    errno = EPERM;
     perror("rdma fetch add: this device don't support atomic operations");
     return -1;
   }
   if (__glibc_unlikely(remote_addr % 8)) {
+    errno = EINVAL;
     perror("rdma cas: remote addr must be 8-byte aligned");
     return -1;
   }
@@ -503,9 +522,11 @@ RDMAFuture RDMAConnection::submit(MsgQueueHandle &qh) {
   m_sending_lock_.unlock();
 
   if (!sd->msg_offsets.empty()) {
-    MsgBlock *first_msg_mb =
-        (MsgBlock *)((char *)sender.m_msg_buf_->addr + sd->msg_offsets.back());
-    first_msg_mb->last_end = true;
+    for (size_t i = 0; i < sd->msg_offsets.size() - 1; ++i) {
+      MsgBlock *last_msg_mb =
+          (MsgBlock *)((char *)sender.m_msg_buf_->addr + sd->msg_offsets[i]);
+      last_msg_mb->not_last_end = true;
+    }
   }
 
   sd->resp_poll_idx = 0;
@@ -596,6 +617,7 @@ RDMAFuture RDMAConnection::submit(MsgQueueHandle &qh) {
   uint32_t inflight = m_inflight_count_.load(std::memory_order_acquire);
   do {
     if (__glibc_unlikely(inflight + combined_wr_size > MAX_SEND_WR)) {
+      errno = ENOSPC;
       perror("ibv_post_send too much inflight wr");
       goto need_retry;
     }
@@ -603,7 +625,8 @@ RDMAFuture RDMAConnection::submit(MsgQueueHandle &qh) {
       inflight, inflight + combined_wr_size, std::memory_order_acquire));
 
   // for (ibv_send_wr *wp = wr_head; wp != nullptr; wp = wp->next) {
-  //   printf("send msg %#lx:%u to %#lx\n", wp->sg_list->addr, wp->sg_list->length,
+  //   printf("send msg %#lx:%u to %#lx\n", wp->sg_list->addr,
+  //   wp->sg_list->length,
   //          wp->wr.rdma.remote_addr);
   // }
 
@@ -696,6 +719,7 @@ int RDMAFuture::try_get(std::vector<const void *> &resp_data_ptr) {
   struct ibv_wc wcs[RDMAConnection::POLL_ENTRY_COUNT];
 
   if (__glibc_unlikely(sd->timeout)) {
+    errno = ETIMEDOUT;
     perror("rdma task timeout");
     return -1;
   }
@@ -722,6 +746,7 @@ int RDMAFuture::try_get(std::vector<const void *> &resp_data_ptr) {
   uint32_t now = get_wall_time<std::chrono::milliseconds>();
   if (__glibc_unlikely(now - sd->now_ms > RDMAConnection::RDMA_TIMEOUT_MS)) {
     sd->timeout = true;
+    errno = ETIMEDOUT;
     perror("rdma task timeout");
     return -1;
   }
