@@ -249,10 +249,10 @@ struct RDMAMsgPollThread {
     std::vector<const void *> resp_tmp;
   };
 
-  volatile bool stop_;
-  RDMASpinLock set_lck_;
-  std::vector<std::pair<RDMAConnection *, ConnContext>> conn_set_;
-  std::thread th_;
+  volatile bool m_stop_;
+  RDMASpinLock m_set_lck_;
+  std::vector<std::pair<RDMAConnection *, ConnContext>> m_conn_set_;
+  std::thread m_th_;
 
   RDMAMsgPollThread();
   ~RDMAMsgPollThread();

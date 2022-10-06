@@ -191,32 +191,32 @@ void RDMAConnection::register_rpc_func(
           resp_max_size));
 }
 
-RDMAMsgPollThread::RDMAMsgPollThread() : stop_(false) {
-  th_ = std::thread(&RDMAMsgPollThread::thread_routine, this);
+RDMAMsgPollThread::RDMAMsgPollThread() : m_stop_(false) {
+  m_th_ = std::thread(&RDMAMsgPollThread::thread_routine, this);
 }
 RDMAMsgPollThread::~RDMAMsgPollThread() {
-  stop_ = true;
-  th_.join();
+  m_stop_ = true;
+  m_th_.join();
 }
 void RDMAMsgPollThread::join_recver_conn(RDMAConnection *conn) {
-  set_lck_.lock();
-  conn_set_.push_back(std::make_pair(conn, ConnContext()));
-  set_lck_.unlock();
+  m_set_lck_.lock();
+  m_conn_set_.push_back(std::make_pair(conn, ConnContext()));
+  m_set_lck_.unlock();
 }
 void RDMAMsgPollThread::exit_recver_conn(RDMAConnection *conn) {
-  set_lck_.lock();
+  m_set_lck_.lock();
   // 这里conn set采用数组，以减少轮询时的cache miss
   // conn退出时时间复杂度较高，但可忽略
-  for (auto it = conn_set_.begin(); it != conn_set_.end(); ++it) {
-    conn_set_.erase(it);
+  for (auto it = m_conn_set_.begin(); it != m_conn_set_.end(); ++it) {
+    m_conn_set_.erase(it);
     break;
   }
-  set_lck_.unlock();
+  m_set_lck_.unlock();
 }
 void RDMAMsgPollThread::thread_routine() {
-  while (!stop_) {
-    set_lck_.lock();
-    for (auto &p : conn_set_) {
+  while (!m_stop_) {
+    m_set_lck_.lock();
+    for (auto &p : m_conn_set_) {
       RDMAConnection *conn = p.first;
       ConnContext &ctx = p.second;
 
@@ -293,7 +293,7 @@ void RDMAMsgPollThread::thread_routine() {
         }
       }
     }
-    set_lck_.unlock();
+    m_set_lck_.unlock();
     std::this_thread::yield();
   }
 }
