@@ -17,6 +17,8 @@ struct p_data_t {
 int main() {
   RDMAEnv::init();
 
+  RDMAConnection::VEC_RECVER_THREAD_BIND_CORE = {0, 1, 2, 3};
+
   RDMAConnection::register_rpc_func(
       1,
       [](RDMAConnection *conn, const void *data, uint32_t size,

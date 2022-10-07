@@ -5,13 +5,9 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
-#include <infiniband/sa.h>
 #include <infiniband/verbs.h>
 #include <map>
-#include <mutex>
-#include <pthread.h>
 #include <rdma/rdma_cma.h>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -109,6 +105,7 @@ struct RDMAFuture {
 };
 
 struct RDMAConnection {
+  // Global Options
   static int MAX_SEND_WR;
   static int MAX_RECV_WR;
   static int MAX_SEND_SGE;
@@ -124,6 +121,7 @@ struct RDMAConnection {
   static size_t MAX_MESSAGE_BUFFER_SIZE;
   static uint32_t MSG_INLINE_THRESHOLD;
   static uint8_t MAX_RECVER_THREAD_COUNT;
+  static std::vector<int16_t> VEC_RECVER_THREAD_BIND_CORE;
 
   RDMAConnection(CQHandle *cq_handle = nullptr, bool rpc_conn = true);
   ~RDMAConnection();
@@ -167,17 +165,20 @@ struct RDMAConnection {
 
   void dealloc_resp_data(const void *data_ptr);
 
+  static void register_rpc_func(
+      uint8_t rpc_op,
+      std::function<void(RDMAConnection *conn, const void *msg_data,
+                         uint32_t size, void *resp_data)> &&rpc_func,
+      uint32_t resp_max_size);
+
   static std::unordered_map<
       uint8_t,
       std::pair<std::function<void(RDMAConnection *conn, const void *msg_data,
                                    uint32_t size, void *resp_data)>,
                 uint32_t>>
       m_rpc_exec_map_;
-  static void register_rpc_func(
-      uint8_t rpc_op,
-      std::function<void(RDMAConnection *conn, const void *msg_data,
-                         uint32_t size, void *resp_data)> &&rpc_func,
-      uint32_t resp_max_size);
+
+  static RDMASpinLock m_core_bind_lock_;
 
   volatile bool m_stop_;
   bool m_rpc_conn_;
@@ -250,6 +251,7 @@ struct RDMAMsgPollThread {
   };
 
   volatile bool m_stop_;
+  int16_t m_core_id_;
   RDMASpinLock m_set_lck_;
   std::vector<std::pair<RDMAConnection *, ConnContext>> m_conn_set_;
   std::thread m_th_;
@@ -259,6 +261,7 @@ struct RDMAMsgPollThread {
   void join_recver_conn(RDMAConnection *conn);
   void exit_recver_conn(RDMAConnection *conn);
   void thread_routine();
+  void core_bind();
 };
 
 #endif // __RDMA_CONN_H__

@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
     uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
                           .count();
-    for (int j = 0; j < 1; ++j) {
+    for (int j = 0; j < 4; ++j) {
       ths.emplace_back([&conn, mr, &pdata]() {
         MsgQueueHandle qh;
         for (int i = 0; i < 100000; ++i) {
@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
                  std::chrono::system_clock::now().time_since_epoch())
                  .count() -
              now_ms) /
-                100000.0 / 1 * 1000
+                100000.0 / 4 * 1000
          << "us" << endl;
   }
 
@@ -159,7 +159,7 @@ int main(int argc, char **argv) {
     uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
                           .count();
-    for (int j = 0; j < 1; ++j) {
+    for (int j = 0; j < 4; ++j) {
       ths.emplace_back([&conn, mr, &pdata]() {
         MsgQueueHandle qh;
         for (int i = 0; i < 100000; ++i) {
@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
                  std::chrono::system_clock::now().time_since_epoch())
                  .count() -
              now_ms) /
-                100000.0 / 1 * 1000
+                100000.0 / 4 * 1000
          << "us" << endl;
   }
 

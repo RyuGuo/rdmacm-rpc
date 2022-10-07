@@ -1,21 +1,7 @@
 #include "rdma_conn.h"
 #include <arpa/inet.h>
-#include <atomic>
-#include <cassert>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <deque>
-#include <infiniband/verbs.h>
-#include <mutex>
 #include <netdb.h>
-#include <netinet/in.h>
-#include <pthread.h>
-#include <rdma/rdma_cma.h>
 #include <set>
-#include <sstream>
-#include <thread>
-#include <unistd.h>
 
 struct conn_param_t {
   uint64_t addr;
@@ -38,6 +24,8 @@ uint32_t RDMAConnection::RDMA_TIMEOUT_MS = 2000;
 size_t RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 4096;
 uint32_t RDMAConnection::MSG_INLINE_THRESHOLD = 64;
 uint8_t RDMAConnection::MAX_RECVER_THREAD_COUNT = 16;
+
+std::vector<int16_t> RDMAConnection::VEC_RECVER_THREAD_BIND_CORE;
 
 bool RDMAConnection::rdma_conn_param_valid() {
   ibv_device_attr device_attr;

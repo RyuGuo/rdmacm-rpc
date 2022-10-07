@@ -1,21 +1,5 @@
 #include "rdma_conn.h"
-#include <arpa/inet.h>
-#include <atomic>
-#include <cassert>
-#include <cerrno>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <deque>
-#include <infiniband/verbs.h>
-#include <mutex>
-#include <netdb.h>
-#include <netinet/in.h>
 #include <pthread.h>
-#include <rdma/rdma_cma.h>
-#include <sstream>
-#include <thread>
-#include <unistd.h>
 
 struct sync_data_t {
   volatile bool wc_finish;
@@ -40,64 +24,6 @@ template <typename Dur> uint64_t get_wall_time() {
   return std::chrono::duration_cast<Dur>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
-}
-
-template <typename T>
-T alloc_buf_ptr(std::atomic<T> &buf_head, T size, T *tail_ptr,
-                std::atomic<T> &left_half_cnt, std::atomic<T> &right_half_cnt,
-                T min_len, T max_len) {
-  T ret;
-  T head_next;
-  T current_head = buf_head.load(std::memory_order_acquire);
-  while (1) {
-    if (current_head + size > max_len) {
-      head_next = size;
-      ret = 0;
-      if (tail_ptr) {
-        *tail_ptr = current_head;
-      }
-    } else {
-      head_next = current_head + size;
-      ret = current_head;
-    }
-    if (head_next + min_len > max_len) {
-      head_next = 0;
-    }
-
-    bool left;
-
-    if (ret < max_len / 2) {
-      if (current_head >= max_len / 2 &&
-          left_half_cnt.load(std::memory_order_acquire) != 0) {
-        return (T)-1;
-      }
-      if (ret + size >= max_len / 2 &&
-          right_half_cnt.load(std::memory_order_acquire) != 0) {
-        return (T)-1;
-      }
-      left_half_cnt.fetch_add(1, std::memory_order_acquire);
-      left = true;
-    } else {
-      if (right_half_cnt.load(std::memory_order_acquire) != 0 &&
-          current_head < max_len / 2) {
-        return (T)-1;
-      }
-      right_half_cnt.fetch_add(1, std::memory_order_acquire);
-      left = false;
-    }
-
-    if (buf_head.compare_exchange_weak(current_head, head_next,
-                                       std::memory_order_acquire)) {
-      break;
-    }
-    if (left) {
-      left_half_cnt.fetch_sub(1, std::memory_order_release);
-    } else {
-      right_half_cnt.fetch_sub(1, std::memory_order_release);
-    }
-    std::this_thread::yield();
-  }
-  return ret;
 }
 
 template <typename T>
@@ -191,12 +117,19 @@ void RDMAConnection::register_rpc_func(
           resp_max_size));
 }
 
-RDMAMsgPollThread::RDMAMsgPollThread() : m_stop_(false) {
+RDMASpinLock RDMAConnection::m_core_bind_lock_;
+
+RDMAMsgPollThread::RDMAMsgPollThread() : m_stop_(false), m_core_id_(-1) {
   m_th_ = std::thread(&RDMAMsgPollThread::thread_routine, this);
 }
 RDMAMsgPollThread::~RDMAMsgPollThread() {
   m_stop_ = true;
   m_th_.join();
+  if (m_core_id_ != -1) {
+    RDMAConnection::m_core_bind_lock_.lock();
+    RDMAConnection::VEC_RECVER_THREAD_BIND_CORE.push_back(m_core_id_);
+    RDMAConnection::m_core_bind_lock_.unlock();
+  }
 }
 void RDMAMsgPollThread::join_recver_conn(RDMAConnection *conn) {
   m_set_lck_.lock();
@@ -213,7 +146,26 @@ void RDMAMsgPollThread::exit_recver_conn(RDMAConnection *conn) {
   }
   m_set_lck_.unlock();
 }
+void RDMAMsgPollThread::core_bind() {
+  if (RDMAConnection::VEC_RECVER_THREAD_BIND_CORE.empty())
+    return;
+  RDMAConnection::m_core_bind_lock_.lock();
+  if (RDMAConnection::VEC_RECVER_THREAD_BIND_CORE.empty())
+    return;
+  m_core_id_ = RDMAConnection::VEC_RECVER_THREAD_BIND_CORE.back();
+  RDMAConnection::VEC_RECVER_THREAD_BIND_CORE.pop_back();
+  RDMAConnection::m_core_bind_lock_.unlock();
+
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  CPU_SET(m_core_id_, &mask);
+  if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) == -1) {
+    perror("pthread_setaffinity_np fail");
+    return;
+  }
+}
 void RDMAMsgPollThread::thread_routine() {
+  core_bind();
   while (!m_stop_) {
     m_set_lck_.lock();
     for (auto &p : m_conn_set_) {
@@ -381,6 +333,12 @@ void *RDMAConnection::prep_rpc_send_defer(MsgQueueHandle &qh, uint8_t rpc_op,
   // printf("send msg: %p %u, ready resp: %p %u\n", msg_mb, msg_mb->msg_size(),
   //        (char *)sender.m_resp_buf_->addr + resp_offset, tmp.msg_size());
 
+  if (!qh.msg_offsets.empty()) {
+    MsgBlock *prev_msg_mb =
+        (MsgBlock *)((char *)sender.m_msg_buf_->addr + qh.msg_offsets.back());
+    prev_msg_mb->not_last_end = true;
+  }
+
   qh.msg_offsets.push_back(msg_offset);
   qh.resp_mbs.push_back(
       (MsgBlock *)((char *)sender.m_resp_buf_->addr + resp_offset));
@@ -520,14 +478,6 @@ RDMAFuture RDMAConnection::submit(MsgQueueHandle &qh) {
   send_msg_wrs.swap(m_msg_qh_.send_wrs);
 
   m_sending_lock_.unlock();
-
-  if (!sd->msg_offsets.empty()) {
-    for (size_t i = 0; i < sd->msg_offsets.size() - 1; ++i) {
-      MsgBlock *last_msg_mb =
-          (MsgBlock *)((char *)sender.m_msg_buf_->addr + sd->msg_offsets[i]);
-      last_msg_mb->not_last_end = true;
-    }
-  }
 
   sd->resp_poll_idx = 0;
   sd->timeout = false;
