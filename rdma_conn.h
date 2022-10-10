@@ -3,10 +3,10 @@
 
 #include <atomic>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <infiniband/verbs.h>
 #include <map>
+#include <queue>
 #include <rdma/rdma_cma.h>
 #include <string>
 #include <thread>
@@ -243,25 +243,57 @@ struct RDMAConnection {
   static int try_poll_resp(sync_data_t *sd);
 };
 
-struct RDMAMsgPollThread {
+struct RDMAMsgRTCThread {
   struct ConnContext {
     MsgQueueHandle recver_qh;
     std::deque<RDMAFuture> hdls;
     std::vector<const void *> resp_tmp;
+    volatile uint64_t th_seq;
+    uint64_t seq_max;
+  };
+
+  struct ThreadTaskPack {
+    RDMAConnection *conn;
+    RDMAMsgRTCThread::ConnContext *ctx;
+    MsgBlock *msg_mb;
+    uint64_t seq;
   };
 
   volatile bool m_stop_;
+  rdma_thread_id_t m_th_id_;
   int16_t m_core_id_;
   RDMASpinLock m_set_lck_;
-  std::vector<std::pair<RDMAConnection *, ConnContext>> m_conn_set_;
   std::thread m_th_;
+  std::vector<std::pair<RDMAConnection *, ConnContext>> m_conn_set_;
+  RDMASpinLock m_task_queue_lck_;
+  std::queue<ThreadTaskPack> m_task_queue_;
 
-  RDMAMsgPollThread();
-  ~RDMAMsgPollThread();
+  RDMAMsgRTCThread(rdma_thread_id_t tid);
+  ~RDMAMsgRTCThread();
   void join_recver_conn(RDMAConnection *conn);
   void exit_recver_conn(RDMAConnection *conn);
   void thread_routine();
   void core_bind();
+};
+
+struct RDMAThreadScheduler {
+  static RDMAThreadScheduler &get_instance() {
+    static RDMAThreadScheduler ts;
+    return ts;
+  }
+
+  rdma_thread_id_t prepick_one_thread();
+  void register_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
+  void unregister_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
+  void task_dispatch(RDMAMsgRTCThread *rpt,
+                   std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps);
+
+  std::vector<RDMAMsgRTCThread *> m_rpt_pool_;
+  // 等待加入的线程队列
+  std::vector<rdma_thread_id_t> m_thread_waiting_pool_;
+
+  RDMAThreadScheduler();
+  ~RDMAThreadScheduler();
 };
 
 #endif // __RDMA_CONN_H__

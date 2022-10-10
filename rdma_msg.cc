@@ -119,10 +119,11 @@ void RDMAConnection::register_rpc_func(
 
 RDMASpinLock RDMAConnection::m_core_bind_lock_;
 
-RDMAMsgPollThread::RDMAMsgPollThread() : m_stop_(false), m_core_id_(-1) {
-  m_th_ = std::thread(&RDMAMsgPollThread::thread_routine, this);
+RDMAMsgRTCThread::RDMAMsgRTCThread(rdma_thread_id_t tid)
+    : m_stop_(false), m_th_id_(tid), m_core_id_(-1) {
+  m_th_ = std::thread(&RDMAMsgRTCThread::thread_routine, this);
 }
-RDMAMsgPollThread::~RDMAMsgPollThread() {
+RDMAMsgRTCThread::~RDMAMsgRTCThread() {
   m_stop_ = true;
   m_th_.join();
   if (m_core_id_ != -1) {
@@ -131,12 +132,12 @@ RDMAMsgPollThread::~RDMAMsgPollThread() {
     RDMAConnection::m_core_bind_lock_.unlock();
   }
 }
-void RDMAMsgPollThread::join_recver_conn(RDMAConnection *conn) {
+void RDMAMsgRTCThread::join_recver_conn(RDMAConnection *conn) {
   m_set_lck_.lock();
   m_conn_set_.push_back(std::make_pair(conn, ConnContext()));
   m_set_lck_.unlock();
 }
-void RDMAMsgPollThread::exit_recver_conn(RDMAConnection *conn) {
+void RDMAMsgRTCThread::exit_recver_conn(RDMAConnection *conn) {
   m_set_lck_.lock();
   // 这里conn set采用数组，以减少轮询时的cache miss
   // conn退出时时间复杂度较高，但可忽略
@@ -146,7 +147,7 @@ void RDMAMsgPollThread::exit_recver_conn(RDMAConnection *conn) {
   }
   m_set_lck_.unlock();
 }
-void RDMAMsgPollThread::core_bind() {
+void RDMAMsgRTCThread::core_bind() {
   if (RDMAConnection::VEC_RECVER_THREAD_BIND_CORE.empty())
     return;
   RDMAConnection::m_core_bind_lock_.lock();
@@ -164,9 +165,13 @@ void RDMAMsgPollThread::core_bind() {
     return;
   }
 }
-void RDMAMsgPollThread::thread_routine() {
+void RDMAMsgRTCThread::thread_routine() {
+  std::vector<ThreadTaskPack> tps;
   core_bind();
+
   while (!m_stop_) {
+    uint64_t ctx_start_seq = 0;
+    uint64_t seq = 0;
     m_set_lck_.lock();
     for (auto &p : m_conn_set_) {
       RDMAConnection *conn = p.first;
@@ -179,12 +184,13 @@ void RDMAMsgPollThread::thread_routine() {
       std::vector<const void *> &resp_tmp = ctx.resp_tmp;
       MsgQueueHandle &recver_qh = ctx.recver_qh;
 
-      MsgBlock *msg_mb =
-          (MsgBlock *)((char *)recver.m_msg_buf_->addr + recver.m_msg_head_);
       // 1. 轮询当前msg_buf的指针指向的mb是否完成
-      if (msg_mb->valid()) {
+      for (MsgBlock *msg_mb = (MsgBlock *)((char *)recver.m_msg_buf_->addr +
+                                           recver.m_msg_head_);
+           msg_mb->valid();
+           msg_mb = (MsgBlock *)((char *)recver.m_msg_buf_->addr +
+                                 recver.m_msg_head_)) {
         // printf("poll %p\n", msg_mb);
-        uint16_t msg_size = msg_mb->msg_size();
 
         // 如果是nop，将轮询指针回环到头
         if (msg_mb->rpc_op == 0) {
@@ -192,38 +198,16 @@ void RDMAMsgPollThread::thread_routine() {
           continue;
         }
 
-        // 2. 为消息返回申请resp_buf
-        MsgBlock *resp_mb = (MsgBlock *)((char *)recver.m_resp_buf_->addr +
-                                         msg_mb->resp_offset);
-        resp_mb->notify = 1;
-        resp_mb->size = m_rpc_exec_map_[msg_mb->rpc_op].second;
-        resp_mb->set_complete_byte();
+        tps.push_back(ThreadTaskPack{
+            .conn = conn,
+            .ctx = &ctx,
+            .msg_mb = msg_mb,
+            .seq = seq,
+        });
 
-        // 3. 执行处理函数
-        m_rpc_exec_map_[msg_mb->rpc_op].first(conn, msg_mb->data, msg_mb->size,
-                                              resp_mb->data);
+        uint16_t msg_size = msg_mb->msg_size();
 
-        // printf("send resp: %#lx %u\n",
-        //        recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
-        //        resp_mb->msg_size());
-
-        // 4. 发送返回
-        conn->prep_write(recver_qh, (uintptr_t)resp_mb,
-                         recver.m_resp_buf_->lkey, resp_mb->msg_size(),
-                         recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
-                         recver.m_peer_resp_buf_rkey_);
-
-        // batch 返回
-        if (!msg_mb->not_last_end) {
-          // printf("send resp clear\n");
-          RDMAFuture hdl = conn->submit(recver_qh);
-          hdls.push_back(hdl);
-        }
-
-        // 5. 清空消息buf
-        memset(msg_mb, 0, msg_size);
-
-        // 6. 推进轮询msg_buf指针
+        // 2. 推进轮询msg_buf指针
         const uint32_t msg_head = recver.m_msg_head_;
         uint32_t msg_head_next;
         if (RDMAConnection::MAX_MESSAGE_BUFFER_SIZE - msg_head - msg_size <
@@ -234,18 +218,100 @@ void RDMAMsgPollThread::thread_routine() {
         }
         recver.m_msg_head_ = msg_head_next;
 
+        ++seq;
+
         // printf("try poll %p\n",
         //        (char *)recver.m_msg_buf_->addr + recver.m_msg_head_);
       }
-      // 7. 轮询返回值是否发送成功
-      if (!hdls.empty()) {
+
+      // 等到该conn的前面所有task完成后才能继续进行
+      while (__atomic_load_n(&ctx.th_seq, __ATOMIC_ACQUIRE) != ctx.seq_max) {
+        std::this_thread::yield();
+      }
+
+      // 将poll msg进行线程执行可序列化
+      ctx.th_seq = ctx_start_seq;
+      ctx.seq_max = seq;
+      ctx_start_seq = seq;
+
+      // 轮询返回值是否发送成功
+      while (!hdls.empty()) {
         RDMAFuture hdl = hdls.front();
         if (hdl.try_get(resp_tmp) == 0) {
           hdls.pop_front();
+        } else {
+          break;
         }
       }
     }
+
+    // 将poll msg分发到其他线程执行
+    RDMAThreadScheduler::get_instance().task_dispatch(this, tps);
+
+    m_task_queue_lck_.lock();
+    while (!m_task_queue_.empty()) {
+      ThreadTaskPack tp = m_task_queue_.front();
+      m_task_queue_.pop();
+      m_task_queue_lck_.unlock();
+
+      RDMAConnection *conn = tp.conn;
+      ConnContext &ctx = *tp.ctx;
+
+      auto &recver = conn->recver;
+      auto &m_rpc_exec_map_ = conn->m_rpc_exec_map_;
+
+      std::deque<RDMAFuture> &hdls = ctx.hdls;
+      std::vector<const void *> &resp_tmp = ctx.resp_tmp;
+      MsgQueueHandle &recver_qh = ctx.recver_qh;
+
+      MsgBlock *msg_mb = tp.msg_mb;
+
+      // 1. 为消息返回申请resp_buf
+      MsgBlock *resp_mb =
+          (MsgBlock *)((char *)recver.m_resp_buf_->addr + msg_mb->resp_offset);
+      resp_mb->notify = 1;
+      resp_mb->size = m_rpc_exec_map_[msg_mb->rpc_op].second;
+      resp_mb->set_complete_byte();
+
+      // 2. 执行处理函数
+      m_rpc_exec_map_[msg_mb->rpc_op].first(conn, msg_mb->data, msg_mb->size,
+                                            resp_mb->data);
+
+      // printf("[%u] send resp: %#lx %u\n", m_th_id_,
+      //        recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
+      //        resp_mb->msg_size());
+
+      uint16_t msg_size = msg_mb->msg_size();
+
+      // 等待前一个task完成
+      while (__atomic_load_n(&ctx.th_seq, __ATOMIC_ACQUIRE) != tp.seq) {
+        std::this_thread::yield();
+      }
+
+      // 3. 发送返回
+      conn->prep_write(recver_qh, (uintptr_t)resp_mb, recver.m_resp_buf_->lkey,
+                       resp_mb->msg_size(),
+                       recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
+                       recver.m_peer_resp_buf_rkey_);
+
+      // batch 返回
+      if (!msg_mb->not_last_end) {
+        // printf("send resp clear\n");
+        RDMAFuture hdl = conn->submit(recver_qh);
+        hdls.push_back(hdl);
+      }
+
+      // 4. 清空消息buf
+      memset(msg_mb, 0, msg_size);
+
+      __atomic_fetch_add(&ctx.th_seq, 1, __ATOMIC_RELEASE);
+
+      m_task_queue_lck_.lock();
+    }
+    m_task_queue_lck_.unlock();
+
     m_set_lck_.unlock();
+    tps.clear();
     std::this_thread::yield();
   }
 }
@@ -571,6 +637,7 @@ RDMAFuture RDMAConnection::submit(MsgQueueHandle &qh) {
       perror("ibv_post_send too much inflight wr");
       goto need_retry;
     }
+    // printf("inflight+: %u\n", inflight);
   } while (!m_inflight_count_.compare_exchange_weak(
       inflight, inflight + combined_wr_size, std::memory_order_acquire));
 
@@ -630,6 +697,8 @@ int RDMAConnection::acknowledge_cqe(int rc, ibv_wc wcs[]) {
     sync_data_t *sd = reinterpret_cast<sync_data_t *>(wc.wr_id);
     sd->conn->m_inflight_count_.fetch_sub(sd->inflight,
                                           std::memory_order_release);
+
+    // printf("inflight-: %u\n", sd->conn->m_inflight_count_.load());
 
     if (__glibc_likely(!sd->timeout)) {
       sd->wc_finish = true;

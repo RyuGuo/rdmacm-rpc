@@ -23,7 +23,7 @@ int RDMAConnection::POLL_ENTRY_COUNT = 2;
 uint32_t RDMAConnection::RDMA_TIMEOUT_MS = 2000;
 size_t RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 4096;
 uint32_t RDMAConnection::MSG_INLINE_THRESHOLD = 64;
-uint8_t RDMAConnection::MAX_RECVER_THREAD_COUNT = 16;
+uint8_t RDMAConnection::MAX_RECVER_THREAD_COUNT = 4;
 
 std::vector<int16_t> RDMAConnection::VEC_RECVER_THREAD_BIND_CORE;
 
@@ -321,26 +321,12 @@ int RDMAConnection::connect(const std::string &ip, uint16_t port) {
   return 0;
 }
 
-void register_recver_conn_worker(
-    std::vector<RDMAMsgPollThread *> &recver_conn_ths, rdma_thread_id_t tid,
-    RDMAConnection *conn) {
-  RDMAMsgPollThread *&rpt = recver_conn_ths[tid];
-  if (!rpt) {
-    rpt = new RDMAMsgPollThread();
-  }
-  rpt->join_recver_conn(conn);
-}
-
 void RDMAConnection::handle_connection() {
   struct rdma_cm_event *event;
   std::set<std::pair<RDMAConnection *, rdma_thread_id_t>> srv_conns;
   std::vector<CQHandle> cq_handles(MAX_RECVER_THREAD_COUNT);
-  std::vector<RDMAMsgPollThread *> rpt_pool(MAX_RECVER_THREAD_COUNT, nullptr);
-  // 等待加入的线程队列
-  std::vector<rdma_thread_id_t> thread_waiting_pool;
-  for (uint8_t i = MAX_RECVER_THREAD_COUNT; i > 0; --i) {
-    thread_waiting_pool.push_back(i - 1);
-  }
+
+  RDMAThreadScheduler &scheduler = RDMAThreadScheduler::get_instance();
 
   while (!m_stop_) {
     if (rdma_get_cm_event(RDMAEnv::get_instance().m_cm_channel_, &event)) {
@@ -356,14 +342,7 @@ void RDMAConnection::handle_connection() {
       rdma_ack_cm_event(event);
 
       // 选出一个thread来进行poll msg
-      rdma_thread_id_t tid = thread_waiting_pool.back();
-      thread_waiting_pool.pop_back();
-      // 如果waiting poll为空，则填充
-      if (thread_waiting_pool.empty()) {
-        for (uint8_t i = MAX_RECVER_THREAD_COUNT; i > 0; --i) {
-          thread_waiting_pool.push_back(i - 1);
-        }
-      }
+      rdma_thread_id_t tid = scheduler.prepick_one_thread();
 
       RDMAConnection *conn =
           new RDMAConnection(&cq_handles[tid], resp_buf_info.rpc_conn);
@@ -372,7 +351,7 @@ void RDMAConnection::handle_connection() {
       conn->recver.m_peer_resp_buf_rkey_ = resp_buf_info.rkey;
       conn->create_connection();
       srv_conns.emplace(conn, tid);
-      register_recver_conn_worker(rpt_pool, tid, conn);
+      scheduler.register_conn_worker(tid, conn);
 
       printf("get event: %s\n", rdma_event_str(event->event));
 
@@ -384,8 +363,7 @@ void RDMAConnection::handle_connection() {
 
       for (auto it = srv_conns.begin(); it != srv_conns.end(); ++it) {
         if (it->first->m_cm_id_ == cm_id) {
-          thread_waiting_pool.push_back(it->second);
-          rpt_pool[it->second]->exit_recver_conn(it->first);
+          scheduler.unregister_conn_worker(it->second, it->first);
           delete it->first;
           srv_conns.erase(it);
           break;
@@ -393,12 +371,6 @@ void RDMAConnection::handle_connection() {
       }
 
       printf("get event: %s\n", rdma_event_str(event->event));
-    }
-  }
-
-  for (auto &rpt : rpt_pool) {
-    if (rpt) {
-      delete rpt;
     }
   }
 
