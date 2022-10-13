@@ -14,14 +14,14 @@ int RDMAConnection::MAX_RECV_WR = 1;
 int RDMAConnection::MAX_SEND_SGE = 1;
 int RDMAConnection::MAX_RECV_SGE = 1;
 int RDMAConnection::CQE_NUM = 32;
-int RDMAConnection::RESOLVE_TIMEOUT_MS = 2000;
+int RDMAConnection::RESOLVE_TIMEOUT_MS = 20000;
 uint8_t RDMAConnection::RETRY_COUNT = 7;
 int RDMAConnection::RNR_RETRY_COUNT = 7;
 uint8_t RDMAConnection::INITIATOR_DEPTH = 2;
 int RDMAConnection::RESPONDER_RESOURCES = 2;
 int RDMAConnection::POLL_ENTRY_COUNT = 2;
-uint32_t RDMAConnection::RDMA_TIMEOUT_MS = 2000;
-size_t RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 4096;
+uint32_t RDMAConnection::RDMA_TIMEOUT_MS = 20000;
+uint32_t RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 4096;
 uint32_t RDMAConnection::MSG_INLINE_THRESHOLD = 64;
 uint8_t RDMAConnection::MAX_RECVER_THREAD_COUNT = 4;
 

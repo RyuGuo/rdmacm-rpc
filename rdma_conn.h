@@ -58,12 +58,13 @@ private:
 
 struct MsgBlock {
   uint32_t size;
-  uint16_t resp_offset;
+  uint32_t prep_resp_size;
+  uint32_t resp_offset;
   uint8_t rpc_op;
   bool not_last_end;
   volatile uint8_t notify;
   union {
-    uint8_t __padding__; // 如果size=0，作为完成标记
+    uint8_t __padding__[1]; // 如果size=0，作为完成标记
     char data[0];
   };
 
@@ -118,7 +119,7 @@ struct RDMAConnection {
   static int RESPONDER_RESOURCES;
   static int POLL_ENTRY_COUNT;
   static uint32_t RDMA_TIMEOUT_MS;
-  static size_t MAX_MESSAGE_BUFFER_SIZE;
+  static uint32_t MAX_MESSAGE_BUFFER_SIZE;
   static uint32_t MSG_INLINE_THRESHOLD;
   static uint8_t MAX_RECVER_THREAD_COUNT;
   static std::vector<int16_t> VEC_RECVER_THREAD_BIND_CORE;
@@ -165,17 +166,23 @@ struct RDMAConnection {
 
   void dealloc_resp_data(const void *data_ptr);
 
+  /**
+   * @param rpc_op 调用操作符
+   * @param rpc_func RPC处理函数
+   *  * @param conn 当前连接
+   *  * @param msg_data 消息
+   *  * @param length 消息大小
+   *  * @param resp_data 数据返回缓冲区
+   *  * @return 数据返回大小
+   */
   static void register_rpc_func(
       uint8_t rpc_op,
-      std::function<void(RDMAConnection *conn, const void *msg_data,
-                         uint32_t size, void *resp_data)> &&rpc_func,
-      uint32_t resp_max_size);
+      std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
+                         uint32_t length, void *resp_data, uint32_t max_resp_data_length)> &&rpc_func);
 
   static std::unordered_map<
-      uint8_t,
-      std::pair<std::function<void(RDMAConnection *conn, const void *msg_data,
-                                   uint32_t size, void *resp_data)>,
-                uint32_t>>
+      uint8_t, std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
+                                  uint32_t length, void *resp_data, uint32_t max_resp_data_length)>>
       m_rpc_exec_map_;
 
   static RDMASpinLock m_core_bind_lock_;
@@ -286,7 +293,7 @@ struct RDMAThreadScheduler {
   void register_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
   void unregister_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
   void task_dispatch(RDMAMsgRTCThread *rpt,
-                   std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps);
+                     std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps);
 
   std::vector<RDMAMsgRTCThread *> m_rpt_pool_;
   // 等待加入的线程队列

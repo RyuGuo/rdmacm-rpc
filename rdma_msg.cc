@@ -1,5 +1,4 @@
 #include "rdma_conn.h"
-#include <pthread.h>
 
 struct sync_data_t {
   volatile bool wc_finish;
@@ -14,10 +13,9 @@ struct sync_data_t {
 };
 
 std::unordered_map<
-    uint8_t,
-    std::pair<std::function<void(RDMAConnection *conn, const void *msg_data,
-                                 uint32_t size, void *resp_data)>,
-              uint32_t>>
+    uint8_t, std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
+                                    uint32_t length, void *resp_data,
+                                    uint32_t max_resp_data_length)>>
     RDMAConnection::m_rpc_exec_map_;
 
 template <typename Dur> uint64_t get_wall_time() {
@@ -99,22 +97,16 @@ void dealloc_sync_data(sync_data_t *sd) {
 
 void RDMAConnection::register_rpc_func(
     uint8_t rpc_op,
-    std::function<void(RDMAConnection *conn, const void *msg_data,
-                       uint32_t size, void *resp_data)> &&rpc_func,
-    uint32_t resp_max_size) {
+    std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
+                           uint32_t length, void *resp_data,
+                           uint32_t max_resp_data_length)> &&rpc_func) {
   if (rpc_op == 0) {
     errno = EINVAL;
     perror("rpc op can't be 0");
     return;
   }
 
-  RDMAConnection::m_rpc_exec_map_.emplace(
-      rpc_op,
-      std::make_pair(
-          std::forward<
-              std::function<void(RDMAConnection * conn, const void *msg_data,
-                                 uint32_t size, void *resp_data)>>(rpc_func),
-          resp_max_size));
+  RDMAConnection::m_rpc_exec_map_.emplace(rpc_op, rpc_func);
 }
 
 RDMASpinLock RDMAConnection::m_core_bind_lock_;
@@ -178,11 +170,9 @@ void RDMAMsgRTCThread::thread_routine() {
       ConnContext &ctx = p.second;
 
       auto &recver = conn->recver;
-      auto &m_rpc_exec_map_ = conn->m_rpc_exec_map_;
 
       std::deque<RDMAFuture> &hdls = ctx.hdls;
       std::vector<const void *> &resp_tmp = ctx.resp_tmp;
-      MsgQueueHandle &recver_qh = ctx.recver_qh;
 
       // 1. 轮询当前msg_buf的指针指向的mb是否完成
       for (MsgBlock *msg_mb = (MsgBlock *)((char *)recver.m_msg_buf_->addr +
@@ -194,6 +184,8 @@ void RDMAMsgRTCThread::thread_routine() {
 
         // 如果是nop，将轮询指针回环到头
         if (msg_mb->rpc_op == 0) {
+          // printf("nop back\n");
+          memset(msg_mb, 0, msg_mb->msg_size());
           recver.m_msg_head_ = 0;
           continue;
         }
@@ -212,6 +204,7 @@ void RDMAMsgRTCThread::thread_routine() {
         uint32_t msg_head_next;
         if (RDMAConnection::MAX_MESSAGE_BUFFER_SIZE - msg_head - msg_size <
             MsgBlock::msg_min_size()) {
+          // printf("turn back (%u %u)\n", msg_head, msg_size);
           msg_head_next = 0;
         } else {
           msg_head_next = msg_head + msg_size;
@@ -261,7 +254,6 @@ void RDMAMsgRTCThread::thread_routine() {
       auto &m_rpc_exec_map_ = conn->m_rpc_exec_map_;
 
       std::deque<RDMAFuture> &hdls = ctx.hdls;
-      std::vector<const void *> &resp_tmp = ctx.resp_tmp;
       MsgQueueHandle &recver_qh = ctx.recver_qh;
 
       MsgBlock *msg_mb = tp.msg_mb;
@@ -270,12 +262,19 @@ void RDMAMsgRTCThread::thread_routine() {
       MsgBlock *resp_mb =
           (MsgBlock *)((char *)recver.m_resp_buf_->addr + msg_mb->resp_offset);
       resp_mb->notify = 1;
-      resp_mb->size = m_rpc_exec_map_[msg_mb->rpc_op].second;
+      resp_mb->size = msg_mb->prep_resp_size;
       resp_mb->set_complete_byte();
 
       // 2. 执行处理函数
-      m_rpc_exec_map_[msg_mb->rpc_op].first(conn, msg_mb->data, msg_mb->size,
-                                            resp_mb->data);
+      uint32_t resp_size = m_rpc_exec_map_[msg_mb->rpc_op](
+          conn, msg_mb->data, msg_mb->size, resp_mb->data,
+          msg_mb->prep_resp_size);
+
+      if (msg_mb->prep_resp_size < resp_size) {
+        errno = EFBIG;
+        perror(
+            "response size is too large, it'll be truncated when sending back");
+      }
 
       // printf("[%u] send resp: %#lx %u\n", m_th_id_,
       //        recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
@@ -296,7 +295,7 @@ void RDMAMsgRTCThread::thread_routine() {
 
       // batch 返回
       if (!msg_mb->not_last_end) {
-        // printf("send resp clear\n");
+        // printf("[%u] send resp clear\n", m_th_id_);
         RDMAFuture hdl = conn->submit(recver_qh);
         hdls.push_back(hdl);
       }
@@ -384,6 +383,7 @@ void *RDMAConnection::prep_rpc_send_defer(MsgQueueHandle &qh, uint8_t rpc_op,
   msg_mb->size = param_data_length;
   msg_mb->notify = 1;
   msg_mb->resp_offset = resp_offset;
+  msg_mb->prep_resp_size = resp_data_length;
   msg_mb->rpc_op = rpc_op;
   msg_mb->set_complete_byte();
 

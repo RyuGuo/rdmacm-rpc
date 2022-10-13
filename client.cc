@@ -17,6 +17,7 @@ struct p_data_t {
 
 int main(int argc, char **argv) {
   RDMAEnv::init();
+  RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 2ul << 20;
 
   RDMAConnection conn;
 
@@ -74,6 +75,8 @@ int main(int argc, char **argv) {
     std::vector<const void *> resp_data_ptr;
     assert(t.get(resp_data_ptr) == 0);
     assert(*(uint64_t *)mr->addr == 4);
+
+    cout << "read ok" << endl;
   }
 
   vector<thread> ths;
@@ -84,23 +87,29 @@ int main(int argc, char **argv) {
     for (int j = 0; j < 4; ++j) {
       ths.emplace_back([&conn]() {
         MsgQueueHandle qh;
-        for (int i = 0; i < 40000; ++i) {
-          int *p =
-              (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
+        for (int i = 0; i < 100000; ++i) {
+          int *p;
+          do {
+            p = (int *)conn.prep_rpc_send_defer(qh, 2, 256, 256);
+          } while (p == nullptr);
           *p = i;
           conn.prep_rpc_send_confirm();
-          p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
-          *p = i + 1;
-          conn.prep_rpc_send_confirm();
+          // do {
+          //   p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i),
+          //   sizeof(int));
+          // } while (p != nullptr);
+          // *p = i + 1;
+          // conn.prep_rpc_send_confirm();
           RDMAFuture fu = conn.submit(qh);
           std::vector<const void *> resp_data_ptr;
           int rc = fu.get(resp_data_ptr);
           assert(rc == 0);
-          assert(resp_data_ptr.size() == 2);
+          assert(resp_data_ptr.size() == 1);
+          // assert(resp_data_ptr.size() == 2);
           assert(*(const int *)resp_data_ptr[0] == i);
-          assert(*(const int *)resp_data_ptr[1] == i + 1);
+          // assert(*(const int *)resp_data_ptr[1] == i + 1);
           conn.dealloc_resp_data(resp_data_ptr[0]);
-          conn.dealloc_resp_data(resp_data_ptr[1]);
+          // conn.dealloc_resp_data(resp_data_ptr[1]);
         }
       });
     }
@@ -112,7 +121,7 @@ int main(int argc, char **argv) {
                  std::chrono::system_clock::now().time_since_epoch())
                  .count() -
              now_ms) /
-                40000.0 / 4 * 1000
+                100000.0 / 4 * 1000
          << "us" << endl;
   }
 
@@ -132,13 +141,16 @@ int main(int argc, char **argv) {
                           pdata.rkey);
           conn.prep_write(qh, (uintptr_t)mr->addr, mr->lkey, PSIZE,
                           pdata.addr + PSIZE, pdata.rkey);
-          int *p =
-              (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
+          int *p;
+          do {
+            p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
+          } while (p == nullptr);
           *p = i;
           conn.prep_rpc_send_confirm();
           RDMAFuture fu = conn.submit(qh);
           std::vector<const void *> resp_data_ptr;
           fu.get(resp_data_ptr);
+          assert(resp_data_ptr.size() == 1);
           conn.dealloc_resp_data(resp_data_ptr[0]);
         }
       });
@@ -169,10 +181,13 @@ int main(int argc, char **argv) {
             uint64_t addr;
             uint32_t length;
           } p = {(uintptr_t)pdata.addr, PSIZE};
-          conn.prep_rpc_send(qh, 3, &p, sizeof(p), 0);
+          while (conn.prep_rpc_send(qh, 3, &p, sizeof(p), 0) == -1)
+            ;
           RDMAFuture fu = conn.submit(qh);
           std::vector<const void *> resp_data_ptr;
           fu.get(resp_data_ptr);
+          assert(resp_data_ptr.size() == 1);
+          assert(resp_data_ptr[0] == nullptr);
         }
       });
     }

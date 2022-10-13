@@ -17,12 +17,13 @@ struct p_data_t {
 int main() {
   RDMAEnv::init();
 
+  RDMAConnection::MAX_RECVER_THREAD_COUNT = 1;
   RDMAConnection::VEC_RECVER_THREAD_BIND_CORE = {0, 1, 2, 3};
+  RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 2ul << 20;
 
   RDMAConnection::register_rpc_func(
-      1,
-      [](RDMAConnection *conn, const void *data, uint32_t size,
-         void *resp_data) {
+      1, [](RDMAConnection *conn, const void *data, uint32_t size,
+            void *resp_data, uint32_t max_resp_data_length) {
         // cout << "get msg 1" << endl;
 
         ibv_mr *mr = conn->register_memory(1 << 20);
@@ -30,27 +31,26 @@ int main() {
         pdata->addr = (uintptr_t)mr->addr;
         pdata->length = mr->length;
         pdata->rkey = mr->rkey;
-      },
-      sizeof(p_data_t));
+        return sizeof(*pdata);
+      });
   RDMAConnection::register_rpc_func(
-      2,
-      [](RDMAConnection *conn, const void *data, uint32_t size,
-         void *resp_data) {
+      2, [](RDMAConnection *conn, const void *data, uint32_t size,
+            void *resp_data, uint32_t max_resp_data_length) {
         // cout << "get msg 2" << endl;
-        memcpy(resp_data, data, sizeof(int));
-      },
-      sizeof(int));
+
+        memcpy(resp_data, data, size);
+        return size;
+      });
   RDMAConnection::register_rpc_func(
-      3,
-      [](RDMAConnection *conn, const void *data, uint32_t size,
-         void *resp_data) {
+      3, [](RDMAConnection *conn, const void *data, uint32_t size,
+            void *resp_data, uint32_t max_resp_data_length) {
         struct {
           uint64_t addr;
           uint32_t length;
         } *p = (decltype(p))data;
         memcpy((void *)(p->addr + p->length), (void *)p->addr, p->length);
-      },
-      0);
+        return 0;
+      });
 
   RDMAConnection conn;
 
