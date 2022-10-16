@@ -13,9 +13,9 @@ struct sync_data_t {
 };
 
 std::unordered_map<
-    uint8_t, std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
-                                    uint32_t length, void *resp_data,
-                                    uint32_t max_resp_data_length)>>
+    uint8_t, std::function<uint32_t(
+                 RDMAConnection *conn, const void *msg_data, uint32_t length,
+                 void *resp_data, uint32_t max_resp_data_length, void **uctx)>>
     RDMAConnection::m_rpc_exec_map_;
 
 template <typename Dur> uint64_t get_wall_time() {
@@ -99,7 +99,8 @@ void RDMAConnection::register_rpc_func(
     uint8_t rpc_op,
     std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
                            uint32_t length, void *resp_data,
-                           uint32_t max_resp_data_length)> &&rpc_func) {
+                           uint32_t max_resp_data_length, void **uctx)>
+        &&rpc_func) {
   if (rpc_op == 0) {
     errno = EINVAL;
     perror("rpc op can't be 0");
@@ -159,6 +160,7 @@ void RDMAMsgRTCThread::core_bind() {
 }
 void RDMAMsgRTCThread::thread_routine() {
   std::vector<ThreadTaskPack> tps;
+  std::vector<ThreadTaskPack> uctx_tps;
   core_bind();
 
   while (!m_stop_) {
@@ -191,6 +193,7 @@ void RDMAMsgRTCThread::thread_routine() {
             .conn = conn,
             .ctx = &ctx,
             .msg_mb = msg_mb,
+            .uctx = nullptr,
         });
 
         uint16_t msg_size = msg_mb->msg_size();
@@ -220,6 +223,10 @@ void RDMAMsgRTCThread::thread_routine() {
     RDMAThreadScheduler::get_instance().task_dispatch(this, tps);
 
     m_task_queue_lck_.lock();
+    for (auto &tp : uctx_tps) {
+      m_task_queue_.push(tp);
+    }
+    uctx_tps.clear();
     while (!m_task_queue_.empty()) {
       ThreadTaskPack tp = m_task_queue_.front();
       m_task_queue_.pop();
@@ -233,21 +240,27 @@ void RDMAMsgRTCThread::thread_routine() {
 
       MsgQueueHandle &recver_qh = *tp.qh_ptr;
 
+      uint32_t msg_size;
       MsgBlock *msg_mb = tp.msg_mb;
 
       // 1. 为消息返回申请resp_buf
       MsgBlock *resp_mb =
           (MsgBlock *)((char *)recver.m_resp_buf_->addr + msg_mb->resp_offset);
-      resp_mb->notify = 1;
-      resp_mb->size = msg_mb->prep_resp_size;
-      resp_mb->set_complete_byte();
+      if (tp.uctx == nullptr) {
+        resp_mb->notify = 1;
+        resp_mb->size = msg_mb->prep_resp_size;
+        resp_mb->set_complete_byte();
+      }
 
       // 2. 执行处理函数
       uint32_t resp_size = m_rpc_exec_map_[msg_mb->rpc_op](
           conn, msg_mb->data, msg_mb->size, resp_mb->data,
-          msg_mb->prep_resp_size);
+          msg_mb->prep_resp_size, &tp.uctx);
 
-      if (msg_mb->prep_resp_size < resp_size) {
+      if (resp_size == -1u) {
+        uctx_tps.push_back(tp);
+        goto contin;
+      } else if (msg_mb->prep_resp_size < resp_size) {
         errno = EFBIG;
         perror(
             "response size is too large, it'll be truncated when sending back");
@@ -257,12 +270,11 @@ void RDMAMsgRTCThread::thread_routine() {
       //        recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
       //        resp_mb->msg_size());
 
-      uint16_t msg_size = msg_mb->msg_size();
+      msg_size = msg_mb->msg_size();
 
       // 等待前一个task完成
       // 这里的等待保证wr与resp msg addr的排序一致性，最大程度起到batch作用
-      // TODO: 采用协程将此处的block异步
-      while (__atomic_load_n(tp.seq_ptr, __ATOMIC_ACQUIRE) != tp.seq) {
+      while (__atomic_load_n(tp.to_seq_ptr, __ATOMIC_ACQUIRE) != tp.seq) {
         std::this_thread::yield();
       }
 
@@ -272,7 +284,6 @@ void RDMAMsgRTCThread::thread_routine() {
                        recver.m_peer_resp_buf_addr_ + msg_mb->resp_offset,
                        recver.m_peer_resp_buf_rkey_);
 
-      // batch 返回
       // 如果不是必要的立即返回（batch
       // rpc，且有些rpc不需要立即返回），可以暂时等待后面的rpc完成
       if (!msg_mb->not_last_end) {
@@ -281,19 +292,19 @@ void RDMAMsgRTCThread::thread_routine() {
         // 那些需要返回消息的tp作为flag task进行回收资源
         RDMAThreadScheduler::get_instance().flag_task_done(tp);
       } else {
-        __atomic_fetch_sub(tp.seq_ptr, 1, __ATOMIC_RELEASE);
+        __atomic_fetch_add(tp.to_seq_ptr, 1, __ATOMIC_RELEASE);
       }
 
       // 4. 清空消息buf
       memset(msg_mb, 0, msg_size);
 
+    contin:
       m_task_queue_lck_.lock();
     }
     m_task_queue_lck_.unlock();
 
     m_set_lck_.unlock();
     tps.clear();
-    std::this_thread::yield();
   }
 }
 

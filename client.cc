@@ -201,6 +201,35 @@ int main(int argc, char **argv) {
          << "us" << endl;
   }
 
+  ths.clear();
+  {
+    uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+    for (int j = 0; j < 4; ++j) {
+      ths.emplace_back([&conn, mr, &pdata]() {
+        MsgQueueHandle qh;
+        for (int i = 0; i < 100000; ++i) {
+          conn.prep_rpc_send(qh, 4, nullptr, 0, 0);
+          RDMAFuture fu = conn.submit(qh);
+          std::vector<const void *> resp_data_ptr;
+          fu.get(resp_data_ptr);
+          assert(resp_data_ptr.size() == 1);
+          assert(resp_data_ptr[0] == nullptr);
+        }
+      });
+    }
+    for (auto &th : ths) {
+      th.join();
+    }
+    cout << (std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::system_clock::now().time_since_epoch())
+                 .count() -
+             now_ms) /
+                100000.0 / 4 * 1000
+         << "us" << endl;
+  }
+
   cout << "test ok" << endl;
 
   return 0;

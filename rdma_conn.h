@@ -177,16 +177,22 @@ struct RDMAConnection {
    *  * @param msg_data 消息
    *  * @param length 消息大小
    *  * @param resp_data 数据返回缓冲区
+   *  * @param uctx
+   * 用户协程，该字段可实现协程状态暂存，需要切换协程时返回-1（用户自行释放）
    *  * @return 数据返回大小
    */
   static void register_rpc_func(
       uint8_t rpc_op,
       std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
-                         uint32_t length, void *resp_data, uint32_t max_resp_data_length)> &&rpc_func);
+                             uint32_t length, void *resp_data,
+                             uint32_t max_resp_data_length, void **uctx)>
+          &&rpc_func);
 
   static std::unordered_map<
-      uint8_t, std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
-                                  uint32_t length, void *resp_data, uint32_t max_resp_data_length)>>
+      uint8_t,
+      std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
+                             uint32_t length, void *resp_data,
+                             uint32_t max_resp_data_length, void **uctx)>>
       m_rpc_exec_map_;
 
   static RDMASpinLock m_core_bind_lock_;
@@ -268,9 +274,9 @@ struct RDMAMsgRTCThread {
     RDMAConnection *conn;
     RDMAMsgRTCThread::ConnContext *ctx;
     MsgBlock *msg_mb;
-    uint64_t seq;
-
-    uint64_t *seq_ptr;
+    void *uctx;
+    uint32_t seq;
+    uint32_t *to_seq_ptr;
     MsgQueueHandle *qh_ptr;
   };
 

@@ -2,7 +2,8 @@
 #include <random>
 
 struct task_sync_data_t {
-  uint64_t seq;
+  uint32_t seq = 0;
+  uint32_t to_seq = 0;
   struct MsgQueueHandle qh;
 };
 // 重用task_sync_data_t的池
@@ -17,6 +18,8 @@ task_sync_data_t *alloc_task_sync_data() {
   }
 }
 void dealloc_task_sync_data(task_sync_data_t *tsd) {
+  tsd->seq = 0;
+  tsd->to_seq = 0;
   tsd->qh.msg_offsets.clear();
   tsd->qh.resp_mbs.clear();
   tsd->qh.sge_wrs.clear();
@@ -64,28 +67,24 @@ void RDMAThreadScheduler::task_dispatch(
   if (tps.empty())
     return;
 
-  {
-    // 设置task的同步序号，以备在submit前进行同步排序
-    
+  // 设置task的同步序号，以备在submit前进行同步排序
+  static thread_local task_sync_data_t *default_tsd = alloc_task_sync_data();
+  static thread_local uint32_t *seq_ptr = &default_tsd->seq;
+  static thread_local uint32_t *to_seq_ptr = &default_tsd->to_seq;
+  static thread_local MsgQueueHandle *qh_ptr = &default_tsd->qh;
 
-    uint64_t *seq_ptr;
-    MsgQueueHandle *qh_ptr;
-    tps.back().msg_mb->not_last_end = false;
-    for (size_t i = tps.size(); i > 0; --i) {
-      auto &tp = tps[i - 1];
-      if (!tp.msg_mb->not_last_end) {
-        task_sync_data_t *tsd = alloc_task_sync_data();
-        seq_ptr = &tsd->seq;
-        qh_ptr = &tsd->qh;
-        *seq_ptr = 0;
-      }
-      ++(*seq_ptr);
-      tp.seq_ptr = seq_ptr;
-      tp.qh_ptr = qh_ptr;
-      tp.seq = *seq_ptr;
+  for (auto &tp : tps) {
+    tp.to_seq_ptr = to_seq_ptr;
+    tp.qh_ptr = qh_ptr;
+    tp.seq = *seq_ptr;
+    ++(*seq_ptr);
+    if (!tp.msg_mb->not_last_end) {
+      task_sync_data_t *tsd = alloc_task_sync_data();
+      seq_ptr = &tsd->seq;
+      to_seq_ptr = &tsd->to_seq;
+      qh_ptr = &tsd->qh;
     }
   }
-
 
   static thread_local std::mt19937_64 rng((uintptr_t)rpt);
 
@@ -115,7 +114,8 @@ void RDMAThreadScheduler::task_dispatch(
     ++i;
   }
 }
+
 void RDMAThreadScheduler::flag_task_done(RDMAMsgRTCThread::ThreadTaskPack &tp) {
-  dealloc_task_sync_data((task_sync_data_t *)((uint64_t)tp.seq_ptr -
-                                              offsetof(task_sync_data_t, seq)));
+  dealloc_task_sync_data((task_sync_data_t *)((uint64_t)tp.qh_ptr -
+                                              offsetof(task_sync_data_t, qh)));
 }
