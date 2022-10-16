@@ -1,6 +1,28 @@
 #include "rdma_conn.h"
 #include <random>
 
+struct task_sync_data_t {
+  uint64_t seq;
+  struct MsgQueueHandle qh;
+};
+// 重用task_sync_data_t的池
+static thread_local std::vector<task_sync_data_t *> tsd_pool;
+task_sync_data_t *alloc_task_sync_data() {
+  if (tsd_pool.empty()) {
+    return new task_sync_data_t();
+  } else {
+    task_sync_data_t *tsd = tsd_pool.back();
+    tsd_pool.pop_back();
+    return tsd;
+  }
+}
+void dealloc_task_sync_data(task_sync_data_t *tsd) {
+  tsd->qh.msg_offsets.clear();
+  tsd->qh.resp_mbs.clear();
+  tsd->qh.sge_wrs.clear();
+  tsd_pool.push_back(tsd);
+}
+
 RDMAThreadScheduler::RDMAThreadScheduler()
     : m_rpt_pool_(RDMAConnection::MAX_RECVER_THREAD_COUNT, nullptr) {
   for (uint8_t i = RDMAConnection::MAX_RECVER_THREAD_COUNT; i > 0; --i) {
@@ -42,20 +64,41 @@ void RDMAThreadScheduler::task_dispatch(
   if (tps.empty())
     return;
 
-  // 这里将第一个和最后一个放在当前线程中执行
-  // 以在最后一个task处理时尽可能保留有效cache到下一请求
+  {
+    // 设置task的同步序号，以备在submit前进行同步排序
+    
+
+    uint64_t *seq_ptr;
+    MsgQueueHandle *qh_ptr;
+    tps.back().msg_mb->not_last_end = false;
+    for (size_t i = tps.size(); i > 0; --i) {
+      auto &tp = tps[i - 1];
+      if (!tp.msg_mb->not_last_end) {
+        task_sync_data_t *tsd = alloc_task_sync_data();
+        seq_ptr = &tsd->seq;
+        qh_ptr = &tsd->qh;
+        *seq_ptr = 0;
+      }
+      ++(*seq_ptr);
+      tp.seq_ptr = seq_ptr;
+      tp.qh_ptr = qh_ptr;
+      tp.seq = *seq_ptr;
+    }
+  }
+
 
   static thread_local std::mt19937_64 rng((uintptr_t)rpt);
 
   // printf("dispatch %luth task to thread %d\n", 0lu, rpt->m_th_id_);
 
+  // 这里将第一个task放在当前线程中执行
   rpt->m_task_queue_lck_.lock();
   rpt->m_task_queue_.emplace(tps.front());
   rpt->m_task_queue_lck_.unlock();
 
   int i = 0;
   uint64_t ur;
-  for (size_t j = 1; j < tps.size() - 1; ++j) {
+  for (size_t j = 1; j < tps.size(); ++j) {
     if (!(i & (sizeof(ur) / sizeof(rdma_thread_id_t) - 1)))
       ur = rng();
 
@@ -71,13 +114,8 @@ void RDMAThreadScheduler::task_dispatch(
     ur >>= sizeof(rdma_thread_id_t) * 8;
     ++i;
   }
-
-  if (tps.size() > 1) {
-    // printf("dispatch %luth task to thread %d\n", tps.size() - 1,
-    // rpt->m_th_id_);
-
-    rpt->m_task_queue_lck_.lock();
-    rpt->m_task_queue_.emplace(tps.back());
-    rpt->m_task_queue_lck_.unlock();
-  }
+}
+void RDMAThreadScheduler::flag_task_done(RDMAMsgRTCThread::ThreadTaskPack &tp) {
+  dealloc_task_sync_data((task_sync_data_t *)((uint64_t)tp.seq_ptr -
+                                              offsetof(task_sync_data_t, seq)));
 }

@@ -17,9 +17,9 @@ struct p_data_t {
 int main() {
   RDMAEnv::init();
 
-  RDMAConnection::MAX_RECVER_THREAD_COUNT = 1;
+  RDMAConnection::MAX_RECVER_THREAD_COUNT = 4;
   RDMAConnection::VEC_RECVER_THREAD_BIND_CORE = {0, 1, 2, 3};
-  RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 2ul << 20;
+  RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 64ul << 10;
 
   RDMAConnection::register_rpc_func(
       1, [](RDMAConnection *conn, const void *data, uint32_t size,

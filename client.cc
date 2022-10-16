@@ -17,7 +17,7 @@ struct p_data_t {
 
 int main(int argc, char **argv) {
   RDMAEnv::init();
-  RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 2ul << 20;
+  RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 64ul << 10;
 
   RDMAConnection conn;
 
@@ -94,22 +94,21 @@ int main(int argc, char **argv) {
           } while (p == nullptr);
           *p = i;
           conn.prep_rpc_send_confirm();
-          // do {
-          //   p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i),
-          //   sizeof(int));
-          // } while (p != nullptr);
-          // *p = i + 1;
-          // conn.prep_rpc_send_confirm();
+          do {
+            p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
+          } while (p == nullptr);
+          *p = i + 1;
+          conn.prep_rpc_send_confirm();
           RDMAFuture fu = conn.submit(qh);
           std::vector<const void *> resp_data_ptr;
           int rc = fu.get(resp_data_ptr);
           assert(rc == 0);
-          assert(resp_data_ptr.size() == 1);
-          // assert(resp_data_ptr.size() == 2);
+          // assert(resp_data_ptr.size() == 1);
+          assert(resp_data_ptr.size() == 2);
           assert(*(const int *)resp_data_ptr[0] == i);
-          // assert(*(const int *)resp_data_ptr[1] == i + 1);
+          assert(*(const int *)resp_data_ptr[1] == i + 1);
           conn.dealloc_resp_data(resp_data_ptr[0]);
-          // conn.dealloc_resp_data(resp_data_ptr[1]);
+          conn.dealloc_resp_data(resp_data_ptr[1]);
         }
       });
     }

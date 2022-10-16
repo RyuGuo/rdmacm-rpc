@@ -6,6 +6,7 @@
 struct conn_param_t {
   uint64_t addr;
   uint32_t rkey;
+  uint32_t size;
   bool rpc_conn;
 };
 
@@ -283,6 +284,7 @@ int RDMAConnection::connect(const std::string &ip, uint16_t port) {
     memset(sender.m_msg_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
     memset(sender.m_resp_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
 
+    resp_buf_info.size = MAX_MESSAGE_BUFFER_SIZE;
     resp_buf_info.addr = (uintptr_t)sender.m_resp_buf_->addr;
     resp_buf_info.rkey = sender.m_resp_buf_->rkey;
   }
@@ -317,6 +319,8 @@ int RDMAConnection::connect(const std::string &ip, uint16_t port) {
 
   sender.m_peer_msg_buf_addr_ = msg_buf_info.addr;
   sender.m_peer_msg_buf_rkey_ = msg_buf_info.rkey;
+  sender.m_matched_buf_size_ =
+      std::min(MAX_MESSAGE_BUFFER_SIZE, msg_buf_info.size);
 
   return 0;
 }
@@ -349,6 +353,8 @@ void RDMAConnection::handle_connection() {
       conn->m_cm_id_ = cm_id;
       conn->recver.m_peer_resp_buf_addr_ = resp_buf_info.addr;
       conn->recver.m_peer_resp_buf_rkey_ = resp_buf_info.rkey;
+      conn->recver.m_matched_buf_size_ =
+          std::min(RDMAConnection::MAX_MESSAGE_BUFFER_SIZE, resp_buf_info.size);
       conn->create_connection();
       srv_conns.emplace(conn, tid);
       scheduler.register_conn_worker(tid, conn);
@@ -393,6 +399,7 @@ void RDMAConnection::create_connection() {
     memset(recver.m_msg_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
     memset(recver.m_resp_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
 
+    msg_buf_info.size = MAX_MESSAGE_BUFFER_SIZE;
     msg_buf_info.addr = (uintptr_t)recver.m_msg_buf_->addr;
     msg_buf_info.rkey = recver.m_msg_buf_->rkey;
   }

@@ -76,6 +76,11 @@ struct MsgBlock {
   }
 };
 
+struct sge_wr {
+  ibv_sge sge;
+  ibv_send_wr wr;
+};
+
 struct CQHandle {
   std::map<ibv_context *, ibv_cq *> cq_map_;
   RDMASpinLock cq_lck_;
@@ -84,8 +89,7 @@ struct CQHandle {
 };
 
 struct MsgQueueHandle {
-  std::vector<ibv_sge> sges;
-  std::vector<ibv_send_wr> send_wrs;
+  std::vector<sge_wr> sge_wrs;
   std::vector<uint32_t> msg_offsets;
   std::vector<MsgBlock *> resp_mbs;
 };
@@ -224,6 +228,8 @@ struct RDMAConnection {
       uint64_t m_peer_msg_buf_addr_;
       uint32_t m_peer_msg_buf_rkey_;
 
+      uint32_t m_matched_buf_size_;
+
       std::atomic<uint32_t> m_msg_buf_left_half_cnt_;
       std::atomic<uint32_t> m_msg_buf_right_half_cnt_;
 
@@ -238,6 +244,8 @@ struct RDMAConnection {
 
       uint64_t m_peer_resp_buf_addr_;
       uint32_t m_peer_resp_buf_rkey_;
+
+      uint32_t m_matched_buf_size_;
     } recver;
   };
 
@@ -246,17 +254,14 @@ struct RDMAConnection {
   void handle_connection();
   void create_connection();
   void msg_recv_work();
+  int poll_conn_sd_wr();
   static int acknowledge_cqe(int rc, ibv_wc wcs[]);
   static int try_poll_resp(sync_data_t *sd);
 };
 
 struct RDMAMsgRTCThread {
   struct ConnContext {
-    MsgQueueHandle recver_qh;
-    std::deque<RDMAFuture> hdls;
     std::vector<const void *> resp_tmp;
-    volatile uint64_t th_seq;
-    uint64_t seq_max;
   };
 
   struct ThreadTaskPack {
@@ -264,6 +269,9 @@ struct RDMAMsgRTCThread {
     RDMAMsgRTCThread::ConnContext *ctx;
     MsgBlock *msg_mb;
     uint64_t seq;
+
+    uint64_t *seq_ptr;
+    MsgQueueHandle *qh_ptr;
   };
 
   volatile bool m_stop_;
@@ -294,6 +302,7 @@ struct RDMAThreadScheduler {
   void unregister_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
   void task_dispatch(RDMAMsgRTCThread *rpt,
                      std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps);
+  void flag_task_done(RDMAMsgRTCThread::ThreadTaskPack &tp);
 
   std::vector<RDMAMsgRTCThread *> m_rpt_pool_;
   // 等待加入的线程队列
