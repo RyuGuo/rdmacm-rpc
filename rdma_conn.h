@@ -22,15 +22,19 @@
 
 using rdma_thread_id_t = uint8_t;
 
-struct RDMASpinLock {
-  pthread_spinlock_t spin_lck_;
-  RDMASpinLock() { pthread_spin_init(&spin_lck_, PTHREAD_PROCESS_PRIVATE); }
-  ~RDMASpinLock() { pthread_spin_destroy(&spin_lck_); }
+class SpinLock {
+public:
+  SpinLock() { pthread_spin_init(&spin_lck_, PTHREAD_PROCESS_PRIVATE); }
+  ~SpinLock() { pthread_spin_destroy(&spin_lck_); }
   int lock() { return pthread_spin_lock(&spin_lck_); }
   int unlock() { return pthread_spin_unlock(&spin_lck_); }
+
+private:
+  pthread_spinlock_t spin_lck_;
 };
 
-struct RDMAEnv {
+class RDMAEnv {
+public:
   RDMAEnv(const RDMAEnv &) = delete;
   RDMAEnv(RDMAEnv &&) = delete;
   RDMAEnv &operator=(const RDMAEnv &) = delete;
@@ -49,20 +53,20 @@ struct RDMAEnv {
 
   std::map<ibv_context *, ibv_pd *> m_pd_map_;
 
-  int __init__();
-
 private:
   RDMAEnv() : m_active_(false) {}
   ~RDMAEnv();
+  int __init__();
 };
 
 struct MsgBlock {
   uint32_t size;
   uint32_t prep_resp_size;
   uint32_t resp_offset;
-  uint8_t rpc_op;
-  bool not_last_end;
-  volatile uint8_t notify;
+  uint16_t rpc_op;
+  bool not_last_end : 1;
+  bool is_buf_last : 1;
+  volatile uint8_t notify : 1;
   union {
     uint8_t __padding__[1]; // 如果size=0，作为完成标记
     char data[0];
@@ -76,29 +80,26 @@ struct MsgBlock {
   }
 };
 
-struct sge_wr {
+struct SgeWr {
   ibv_sge sge;
   ibv_send_wr wr;
 };
 
 struct CQHandle {
-  std::map<ibv_context *, ibv_cq *> cq_map_;
-  RDMASpinLock cq_lck_;
-  CQHandle() {}
+  std::map<ibv_context *, ibv_cq *> m_cq_map_;
+  SpinLock m_cq_lck_;
   ~CQHandle();
 };
 
 struct MsgQueueHandle {
-  std::vector<sge_wr> sge_wrs;
-  std::vector<uint32_t> msg_offsets;
-  std::vector<MsgBlock *> resp_mbs;
+  std::vector<SgeWr> m_sge_wrs_;
+  std::vector<uint32_t> m_msg_offsets_;
+  std::vector<MsgBlock *> m_resp_mbs_;
 };
 
-struct sync_data_t;
+struct SyncData;
 
 struct RDMAFuture {
-  sync_data_t *sd;
-
   int get(std::vector<const void *> &resp_data_ptr);
   /**
    * @return
@@ -107,6 +108,8 @@ struct RDMAFuture {
    *  * -1 - error
    */
   int try_get(std::vector<const void *> &resp_data_ptr);
+
+  SyncData *m_sd_;
 };
 
 struct RDMAConnection {
@@ -182,20 +185,20 @@ struct RDMAConnection {
    *  * @return 数据返回大小
    */
   static void register_rpc_func(
-      uint8_t rpc_op,
+      uint16_t rpc_op,
       std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
                              uint32_t length, void *resp_data,
                              uint32_t max_resp_data_length, void **uctx)>
           &&rpc_func);
 
   static std::unordered_map<
-      uint8_t,
+      uint16_t,
       std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
                              uint32_t length, void *resp_data,
                              uint32_t max_resp_data_length, void **uctx)>>
       m_rpc_exec_map_;
 
-  static RDMASpinLock m_core_bind_lock_;
+  static SpinLock m_core_bind_lock_;
 
   volatile bool m_stop_;
   bool m_rpc_conn_;
@@ -209,7 +212,7 @@ struct RDMAConnection {
   std::thread *m_conn_handler_;
   std::atomic<uint32_t> m_inflight_count_ = {0};
 
-  RDMASpinLock m_sending_lock_;
+  SpinLock m_sending_lock_;
   MsgQueueHandle m_msg_qh_;
   std::atomic<uint32_t> m_send_defer_cnt_;
 
@@ -241,7 +244,7 @@ struct RDMAConnection {
 
       std::atomic<uint32_t> m_resp_buf_left_half_cnt_;
       std::atomic<uint32_t> m_resp_buf_right_half_cnt_;
-    } sender;
+    } m_sender_;
     struct {
       uint32_t m_msg_head_;
       uint32_t m_resp_head_;
@@ -252,23 +255,20 @@ struct RDMAConnection {
       uint32_t m_peer_resp_buf_rkey_;
 
       uint32_t m_matched_buf_size_;
-    } recver;
+    } m_recver_;
   };
 
-  bool rdma_conn_param_valid();
-  int create_ibv_connection();
-  void handle_connection();
-  void create_connection();
-  void msg_recv_work();
-  int poll_conn_sd_wr();
-  static int acknowledge_cqe(int rc, ibv_wc wcs[]);
-  static int try_poll_resp(sync_data_t *sd);
+  bool m_rdma_conn_param_valid_();
+  int m_create_ibv_connection_();
+  void m_handle_connection_();
+  void m_create_connection_();
+  int m_poll_conn_sd_wr_();
+  static int m_acknowledge_cqe_(int rc, ibv_wc wcs[]);
+  static int m_try_poll_resp_(SyncData *sd);
 };
 
 struct RDMAMsgRTCThread {
-  struct ConnContext {
-    std::vector<const void *> resp_tmp;
-  };
+  struct ConnContext {};
 
   struct ThreadTaskPack {
     RDMAConnection *conn;
@@ -277,16 +277,25 @@ struct RDMAMsgRTCThread {
     void *uctx;
     uint32_t seq;
     uint32_t *to_seq_ptr;
-    MsgQueueHandle *qh_ptr;
+  };
+
+  struct ThreadTaskQueue {
+    void push(ThreadTaskPack *tps, size_t n);
+    bool pop(ThreadTaskPack *tp);
+
+    ThreadTaskQueue();
+    ~ThreadTaskQueue();
+
+    void *q;
   };
 
   volatile bool m_stop_;
   rdma_thread_id_t m_th_id_;
   int16_t m_core_id_;
-  RDMASpinLock m_set_lck_;
+  SpinLock m_set_lck_;
   std::thread m_th_;
   std::vector<std::pair<RDMAConnection *, ConnContext>> m_conn_set_;
-  RDMASpinLock m_task_queue_lck_;
+  SpinLock m_task_queue_lck_;
   std::queue<ThreadTaskPack> m_task_queue_;
 
   RDMAMsgRTCThread(rdma_thread_id_t tid);
@@ -297,11 +306,17 @@ struct RDMAMsgRTCThread {
   void core_bind();
 };
 
-struct RDMAThreadScheduler {
+class RDMAThreadScheduler {
+public:
   static RDMAThreadScheduler &get_instance() {
     static RDMAThreadScheduler ts;
     return ts;
   }
+
+  RDMAThreadScheduler(const RDMAThreadScheduler &) = delete;
+  RDMAThreadScheduler(RDMAThreadScheduler &&) = delete;
+  RDMAThreadScheduler &operator=(const RDMAThreadScheduler &) = delete;
+  RDMAThreadScheduler &operator=(RDMAThreadScheduler &&) = delete;
 
   rdma_thread_id_t prepick_one_thread();
   void register_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
@@ -310,6 +325,7 @@ struct RDMAThreadScheduler {
                      std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps);
   void flag_task_done(RDMAMsgRTCThread::ThreadTaskPack &tp);
 
+private:
   std::vector<RDMAMsgRTCThread *> m_rpt_pool_;
   // 等待加入的线程队列
   std::vector<rdma_thread_id_t> m_thread_waiting_pool_;

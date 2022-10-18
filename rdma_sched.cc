@@ -4,7 +4,6 @@
 struct task_sync_data_t {
   uint32_t seq = 0;
   uint32_t to_seq = 0;
-  struct MsgQueueHandle qh;
 };
 // 重用task_sync_data_t的池
 static thread_local std::vector<task_sync_data_t *> tsd_pool;
@@ -20,9 +19,6 @@ task_sync_data_t *alloc_task_sync_data() {
 void dealloc_task_sync_data(task_sync_data_t *tsd) {
   tsd->seq = 0;
   tsd->to_seq = 0;
-  tsd->qh.msg_offsets.clear();
-  tsd->qh.resp_mbs.clear();
-  tsd->qh.sge_wrs.clear();
   tsd_pool.push_back(tsd);
 }
 
@@ -64,25 +60,22 @@ void RDMAThreadScheduler::unregister_conn_worker(rdma_thread_id_t tid,
 }
 void RDMAThreadScheduler::task_dispatch(
     RDMAMsgRTCThread *rpt, std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps) {
-  if (tps.empty())
+  if (tps.size() == 0)
     return;
 
   // 设置task的同步序号，以备在submit前进行同步排序
   static thread_local task_sync_data_t *default_tsd = alloc_task_sync_data();
   static thread_local uint32_t *seq_ptr = &default_tsd->seq;
   static thread_local uint32_t *to_seq_ptr = &default_tsd->to_seq;
-  static thread_local MsgQueueHandle *qh_ptr = &default_tsd->qh;
 
   for (auto &tp : tps) {
     tp.to_seq_ptr = to_seq_ptr;
-    tp.qh_ptr = qh_ptr;
     tp.seq = *seq_ptr;
     ++(*seq_ptr);
     if (!tp.msg_mb->not_last_end) {
       task_sync_data_t *tsd = alloc_task_sync_data();
       seq_ptr = &tsd->seq;
       to_seq_ptr = &tsd->to_seq;
-      qh_ptr = &tsd->qh;
     }
   }
 
@@ -96,7 +89,7 @@ void RDMAThreadScheduler::task_dispatch(
   rpt->m_task_queue_lck_.unlock();
 
   int i = 0;
-  uint64_t ur;
+  uint64_t ur = 0;
   for (size_t j = 1; j < tps.size(); ++j) {
     if (!(i & (sizeof(ur) / sizeof(rdma_thread_id_t) - 1)))
       ur = rng();
@@ -116,6 +109,7 @@ void RDMAThreadScheduler::task_dispatch(
 }
 
 void RDMAThreadScheduler::flag_task_done(RDMAMsgRTCThread::ThreadTaskPack &tp) {
-  dealloc_task_sync_data((task_sync_data_t *)((uint64_t)tp.qh_ptr -
-                                              offsetof(task_sync_data_t, qh)));
+  dealloc_task_sync_data(
+      (task_sync_data_t *)((uint64_t)tp.to_seq_ptr -
+                           offsetof(task_sync_data_t, to_seq)));
 }

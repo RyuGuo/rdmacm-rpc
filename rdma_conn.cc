@@ -28,7 +28,7 @@ uint8_t RDMAConnection::MAX_RECVER_THREAD_COUNT = 4;
 
 std::vector<int16_t> RDMAConnection::VEC_RECVER_THREAD_BIND_CORE;
 
-bool RDMAConnection::rdma_conn_param_valid() {
+bool RDMAConnection::m_rdma_conn_param_valid_() {
   ibv_device_attr device_attr;
   if (ibv_query_device(m_cm_id_->verbs, &device_attr) != 0) {
     perror("ibv_query_device fail");
@@ -86,7 +86,7 @@ RDMAEnv::~RDMAEnv() {
 }
 
 CQHandle::~CQHandle() {
-  for (auto &p : cq_map_) {
+  for (auto &p : m_cq_map_) {
     ibv_destroy_cq(p.second);
   }
 }
@@ -105,16 +105,16 @@ RDMAConnection::~RDMAConnection() {
       ibv_destroy_cq(m_cq_);
     }
     ibv_destroy_comp_channel(m_comp_chan_);
-    ibv_dereg_mr(sender.m_msg_buf_);
-    ibv_dereg_mr(sender.m_resp_buf_);
-    free(sender.m_msg_buf_->addr);
-    free(sender.m_resp_buf_->addr);
+    ibv_dereg_mr(m_sender_.m_msg_buf_);
+    ibv_dereg_mr(m_sender_.m_resp_buf_);
+    free(m_sender_.m_msg_buf_->addr);
+    free(m_sender_.m_resp_buf_->addr);
   }
   rdma_destroy_id(m_cm_id_);
 }
 
-int RDMAConnection::create_ibv_connection() {
-  if (!rdma_conn_param_valid()) {
+int RDMAConnection::m_create_ibv_connection_() {
+  if (!m_rdma_conn_param_valid_()) {
     perror("rdma_conn_param_valid fail");
     return -1;
   }
@@ -147,13 +147,13 @@ int RDMAConnection::create_ibv_connection() {
   };
 
   if (m_cq_handle_) {
-    m_cq_handle_->cq_lck_.lock();
-    auto it = m_cq_handle_->cq_map_.find(m_cm_id_->verbs);
-    if (it == m_cq_handle_->cq_map_.end()) {
-      it = m_cq_handle_->cq_map_.emplace(m_cm_id_->verbs, create_cq_fn()).first;
+    m_cq_handle_->m_cq_lck_.lock();
+    auto it = m_cq_handle_->m_cq_map_.find(m_cm_id_->verbs);
+    if (it == m_cq_handle_->m_cq_map_.end()) {
+      it = m_cq_handle_->m_cq_map_.emplace(m_cm_id_->verbs, create_cq_fn()).first;
     }
     m_cq_ = it->second;
-    m_cq_handle_->cq_lck_.unlock();
+    m_cq_handle_->m_cq_lck_.unlock();
   } else {
     m_cq_ = create_cq_fn();
   }
@@ -202,7 +202,7 @@ int RDMAConnection::listen(const std::string &ip, uint16_t port) {
     return -1;
   }
 
-  m_conn_handler_ = new std::thread(&RDMAConnection::handle_connection, this);
+  m_conn_handler_ = new std::thread(&RDMAConnection::m_handle_connection_, this);
   if (!m_conn_handler_) {
     perror("rdma connect fail");
     return -1;
@@ -267,26 +267,26 @@ int RDMAConnection::connect(const std::string &ip, uint16_t port) {
 
   rdma_ack_cm_event(event);
 
-  if (create_ibv_connection()) {
+  if (m_create_ibv_connection_()) {
     return -1;
   }
 
   conn_param_t resp_buf_info = {};
   if (m_rpc_conn_) {
-    sender.m_msg_head_ = 0;
-    sender.m_resp_head_ = 0;
-    sender.m_msg_buf_left_half_cnt_ = 0;
-    sender.m_msg_buf_right_half_cnt_ = 0;
-    sender.m_resp_buf_left_half_cnt_ = 0;
-    sender.m_resp_buf_right_half_cnt_ = 0;
-    sender.m_msg_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
-    sender.m_resp_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
-    memset(sender.m_msg_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
-    memset(sender.m_resp_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
+    m_sender_.m_msg_head_ = 0;
+    m_sender_.m_resp_head_ = 0;
+    m_sender_.m_msg_buf_left_half_cnt_ = 0;
+    m_sender_.m_msg_buf_right_half_cnt_ = 0;
+    m_sender_.m_resp_buf_left_half_cnt_ = 0;
+    m_sender_.m_resp_buf_right_half_cnt_ = 0;
+    m_sender_.m_msg_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
+    m_sender_.m_resp_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
+    memset(m_sender_.m_msg_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
+    memset(m_sender_.m_resp_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
 
     resp_buf_info.size = MAX_MESSAGE_BUFFER_SIZE;
-    resp_buf_info.addr = (uintptr_t)sender.m_resp_buf_->addr;
-    resp_buf_info.rkey = sender.m_resp_buf_->rkey;
+    resp_buf_info.addr = (uintptr_t)m_sender_.m_resp_buf_->addr;
+    resp_buf_info.rkey = m_sender_.m_resp_buf_->rkey;
   }
   resp_buf_info.rpc_conn = m_rpc_conn_;
 
@@ -317,15 +317,15 @@ int RDMAConnection::connect(const std::string &ip, uint16_t port) {
   memcpy(&msg_buf_info, event->param.conn.private_data, sizeof(msg_buf_info));
   rdma_ack_cm_event(event);
 
-  sender.m_peer_msg_buf_addr_ = msg_buf_info.addr;
-  sender.m_peer_msg_buf_rkey_ = msg_buf_info.rkey;
-  sender.m_matched_buf_size_ =
+  m_sender_.m_peer_msg_buf_addr_ = msg_buf_info.addr;
+  m_sender_.m_peer_msg_buf_rkey_ = msg_buf_info.rkey;
+  m_sender_.m_matched_buf_size_ =
       std::min(MAX_MESSAGE_BUFFER_SIZE, msg_buf_info.size);
 
   return 0;
 }
 
-void RDMAConnection::handle_connection() {
+void RDMAConnection::m_handle_connection_() {
   struct rdma_cm_event *event;
   std::set<std::pair<RDMAConnection *, rdma_thread_id_t>> srv_conns;
   std::vector<CQHandle> cq_handles(MAX_RECVER_THREAD_COUNT);
@@ -351,11 +351,11 @@ void RDMAConnection::handle_connection() {
       RDMAConnection *conn =
           new RDMAConnection(&cq_handles[tid], resp_buf_info.rpc_conn);
       conn->m_cm_id_ = cm_id;
-      conn->recver.m_peer_resp_buf_addr_ = resp_buf_info.addr;
-      conn->recver.m_peer_resp_buf_rkey_ = resp_buf_info.rkey;
-      conn->recver.m_matched_buf_size_ =
+      conn->m_recver_.m_peer_resp_buf_addr_ = resp_buf_info.addr;
+      conn->m_recver_.m_peer_resp_buf_rkey_ = resp_buf_info.rkey;
+      conn->m_recver_.m_matched_buf_size_ =
           std::min(RDMAConnection::MAX_MESSAGE_BUFFER_SIZE, resp_buf_info.size);
-      conn->create_connection();
+      conn->m_create_connection_();
       srv_conns.emplace(conn, tid);
       scheduler.register_conn_worker(tid, conn);
 
@@ -385,23 +385,23 @@ void RDMAConnection::handle_connection() {
   }
 }
 
-void RDMAConnection::create_connection() {
-  if (create_ibv_connection()) {
+void RDMAConnection::m_create_connection_() {
+  if (m_create_ibv_connection_()) {
     return;
   }
 
   conn_param_t msg_buf_info = {};
   if (m_rpc_conn_) {
-    recver.m_msg_head_ = 0;
-    recver.m_resp_head_ = 0;
-    recver.m_msg_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
-    recver.m_resp_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
-    memset(recver.m_msg_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
-    memset(recver.m_resp_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
+    m_recver_.m_msg_head_ = 0;
+    m_recver_.m_resp_head_ = 0;
+    m_recver_.m_msg_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
+    m_recver_.m_resp_buf_ = register_memory(MAX_MESSAGE_BUFFER_SIZE);
+    memset(m_recver_.m_msg_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
+    memset(m_recver_.m_resp_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
 
     msg_buf_info.size = MAX_MESSAGE_BUFFER_SIZE;
-    msg_buf_info.addr = (uintptr_t)recver.m_msg_buf_->addr;
-    msg_buf_info.rkey = recver.m_msg_buf_->rkey;
+    msg_buf_info.addr = (uintptr_t)m_recver_.m_msg_buf_->addr;
+    msg_buf_info.rkey = m_recver_.m_msg_buf_->rkey;
   }
 
   rdma_conn_param conn_param = {};
