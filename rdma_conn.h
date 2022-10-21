@@ -137,6 +137,9 @@ struct RDMAConnection {
   int listen(const std::string &ip, uint16_t port);
   int connect(const std::string &ip, uint16_t port);
 
+  std::pair<std::string, in_port_t> get_local_addr();
+  std::pair<std::string, in_port_t> get_peer_addr();
+
   ibv_mr *register_memory(void *ptr, size_t size);
   ibv_mr *register_memory(size_t size);
 
@@ -191,12 +194,20 @@ struct RDMAConnection {
                              uint32_t max_resp_data_length, void **uctx)>
           &&rpc_func);
 
+  static void register_connect_hook(
+      std::function<void(RDMAConnection *conn)> &&hook_connect);
+  static void register_disconnect_hook(
+      std::function<void(RDMAConnection *conn)> &&m_hook_disconnect);
+
   static std::unordered_map<
       uint16_t,
       std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
                              uint32_t length, void *resp_data,
                              uint32_t max_resp_data_length, void **uctx)>>
       m_rpc_exec_map_;
+
+  static std::function<void(RDMAConnection *conn)> m_hook_connect_;
+  static std::function<void(RDMAConnection *conn)> m_hook_disconnect_;
 
   static SpinLock m_core_bind_lock_;
 

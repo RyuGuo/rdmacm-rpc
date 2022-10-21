@@ -1,11 +1,6 @@
 #include "rdma_conn.h"
 #include <chrono>
-#include <condition_variable>
-#include <cstdint>
-#include <cstdio>
 #include <iostream>
-#include <mutex>
-#include <sstream>
 #include <thread>
 
 using namespace std;
@@ -77,6 +72,13 @@ int main() {
         delete s;
         return 0u;
       });
+
+  RDMAConnection::register_connect_hook([](RDMAConnection *conn) {
+    cout << "Get New Connect:" << conn->get_peer_addr().first << endl;
+  });
+  RDMAConnection::register_disconnect_hook([](RDMAConnection *conn) {
+    cout << "Disconnect: " << conn->get_peer_addr().first << endl;
+  });
 
   RDMAConnection conn;
 

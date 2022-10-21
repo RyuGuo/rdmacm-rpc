@@ -1,11 +1,7 @@
 #include "rdma_conn.h"
 #include <cassert>
-#include <cstdint>
-#include <cstring>
 #include <iostream>
-#include <sstream>
 #include <thread>
-#include <tuple>
 
 using namespace std;
 

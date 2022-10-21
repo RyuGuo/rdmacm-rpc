@@ -215,7 +215,7 @@ void RDMAMsgRTCThread::thread_routine() {
     // 将poll msg分发到其他线程执行
     RDMAThreadScheduler::get_instance().task_dispatch(this, tps);
 
-    if (uctx_tps.size() != 0) {
+    if (!uctx_tps.empty()) {
       m_task_queue_lck_.lock();
       for (auto &tp : uctx_tps) {
         m_task_queue_.push(tp);

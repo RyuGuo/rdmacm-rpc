@@ -1,7 +1,6 @@
 #include "rdma_conn.h"
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <set>
 
 struct conn_param_t {
   uint64_t addr;
@@ -15,18 +14,21 @@ int RDMAConnection::MAX_RECV_WR = 1;
 int RDMAConnection::MAX_SEND_SGE = 1;
 int RDMAConnection::MAX_RECV_SGE = 1;
 int RDMAConnection::CQE_NUM = 32;
-int RDMAConnection::RESOLVE_TIMEOUT_MS = 20000;
+int RDMAConnection::RESOLVE_TIMEOUT_MS = 2000;
 uint8_t RDMAConnection::RETRY_COUNT = 7;
 int RDMAConnection::RNR_RETRY_COUNT = 7;
 uint8_t RDMAConnection::INITIATOR_DEPTH = 2;
 int RDMAConnection::RESPONDER_RESOURCES = 2;
 int RDMAConnection::POLL_ENTRY_COUNT = 2;
-uint32_t RDMAConnection::RDMA_TIMEOUT_MS = 20000;
+uint32_t RDMAConnection::RDMA_TIMEOUT_MS = 2000;
 uint32_t RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 4096;
 uint32_t RDMAConnection::MSG_INLINE_THRESHOLD = 64;
 uint8_t RDMAConnection::MAX_RECVER_THREAD_COUNT = 4;
 
 std::vector<int16_t> RDMAConnection::VEC_RECVER_THREAD_BIND_CORE;
+
+std::function<void(RDMAConnection *conn)> RDMAConnection::m_hook_connect_;
+std::function<void(RDMAConnection *conn)> RDMAConnection::m_hook_disconnect_;
 
 bool RDMAConnection::m_rdma_conn_param_valid_() {
   ibv_device_attr device_attr;
@@ -327,7 +329,8 @@ int RDMAConnection::connect(const std::string &ip, uint16_t port) {
 
 void RDMAConnection::m_handle_connection_() {
   struct rdma_cm_event *event;
-  std::set<std::pair<RDMAConnection *, rdma_thread_id_t>> srv_conns;
+  std::map<rdma_cm_id *, std::pair<RDMAConnection *, rdma_thread_id_t>>
+      srv_conns;
   std::vector<CQHandle> cq_handles(MAX_RECVER_THREAD_COUNT);
 
   RDMAThreadScheduler &scheduler = RDMAThreadScheduler::get_instance();
@@ -356,10 +359,11 @@ void RDMAConnection::m_handle_connection_() {
       conn->m_recver_.m_matched_buf_size_ =
           std::min(RDMAConnection::MAX_MESSAGE_BUFFER_SIZE, resp_buf_info.size);
       conn->m_create_connection_();
-      srv_conns.emplace(conn, tid);
+      srv_conns.emplace(cm_id, std::make_pair(conn, tid));
       scheduler.register_conn_worker(tid, conn);
 
-      printf("get event: %s\n", rdma_event_str(event->event));
+      if (m_hook_connect_)
+        m_hook_connect_(conn);
 
     } else if (event->event == RDMA_CM_EVENT_ESTABLISHED) {
       rdma_ack_cm_event(event);
@@ -367,16 +371,13 @@ void RDMAConnection::m_handle_connection_() {
       struct rdma_cm_id *cm_id = event->id;
       rdma_ack_cm_event(event);
 
-      for (auto it = srv_conns.begin(); it != srv_conns.end(); ++it) {
-        if (it->first->m_cm_id_ == cm_id) {
-          scheduler.unregister_conn_worker(it->second, it->first);
-          delete it->first;
-          srv_conns.erase(it);
-          break;
-        }
-      }
+      auto it = srv_conns.find(cm_id);
+      if (m_hook_disconnect_)
+        m_hook_disconnect_(it->second.first);
+      scheduler.unregister_conn_worker(it->second.second, it->second.first);
 
-      printf("get event: %s\n", rdma_event_str(event->event));
+      delete it->first;
+      srv_conns.erase(it);
     }
   }
 
@@ -418,6 +419,15 @@ void RDMAConnection::m_create_connection_() {
   }
 }
 
+std::pair<std::string, in_port_t> RDMAConnection::get_local_addr() {
+  sockaddr_in *sin = (sockaddr_in *)rdma_get_local_addr(m_cm_id_);
+  return std::make_pair(inet_ntoa(sin->sin_addr), (sin->sin_port));
+}
+std::pair<std::string, in_port_t> RDMAConnection::get_peer_addr() {
+  sockaddr_in *sin = (sockaddr_in *)rdma_get_peer_addr(m_cm_id_);
+  return std::make_pair(inet_ntoa(sin->sin_addr), (sin->sin_port));
+}
+
 ibv_mr *RDMAConnection::register_memory(size_t size) {
   void *ptr = aligned_alloc(4096, size);
   if (!ptr) {
@@ -439,4 +449,16 @@ ibv_mr *RDMAConnection::register_memory(void *ptr, size_t size) {
     return nullptr;
   }
   return mr;
+}
+
+void RDMAConnection::register_connect_hook(
+    std::function<void(RDMAConnection *conn)> &&hook_connect) {
+  m_hook_connect_ =
+      std::forward<std::function<void(RDMAConnection * conn)>>(hook_connect);
+}
+
+void RDMAConnection::register_disconnect_hook(
+    std::function<void(RDMAConnection *conn)> &&m_hook_disconnect) {
+  m_hook_disconnect_ = std::forward<std::function<void(RDMAConnection * conn)>>(
+      m_hook_disconnect);
 }
