@@ -152,7 +152,8 @@ int RDMAConnection::m_create_ibv_connection_() {
     m_cq_handle_->m_cq_lck_.lock();
     auto it = m_cq_handle_->m_cq_map_.find(m_cm_id_->verbs);
     if (it == m_cq_handle_->m_cq_map_.end()) {
-      it = m_cq_handle_->m_cq_map_.emplace(m_cm_id_->verbs, create_cq_fn()).first;
+      it = m_cq_handle_->m_cq_map_.emplace(m_cm_id_->verbs, create_cq_fn())
+               .first;
     }
     m_cq_ = it->second;
     m_cq_handle_->m_cq_lck_.unlock();
@@ -204,7 +205,8 @@ int RDMAConnection::listen(const std::string &ip, uint16_t port) {
     return -1;
   }
 
-  m_conn_handler_ = new std::thread(&RDMAConnection::m_handle_connection_, this);
+  m_conn_handler_ =
+      new std::thread(&RDMAConnection::m_handle_connection_, this);
   if (!m_conn_handler_) {
     perror("rdma connect fail");
     return -1;
@@ -458,7 +460,7 @@ void RDMAConnection::register_connect_hook(
 }
 
 void RDMAConnection::register_disconnect_hook(
-    std::function<void(RDMAConnection *conn)> &&m_hook_disconnect) {
-  m_hook_disconnect_ = std::forward<std::function<void(RDMAConnection * conn)>>(
-      m_hook_disconnect);
+    std::function<void(RDMAConnection *conn)> &&hook_disconnect) {
+  m_hook_disconnect_ =
+      std::forward<std::function<void(RDMAConnection * conn)>>(hook_disconnect);
 }

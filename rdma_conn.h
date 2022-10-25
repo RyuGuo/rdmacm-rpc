@@ -176,6 +176,8 @@ struct RDMAConnection {
 
   void dealloc_resp_data(const void *data_ptr);
 
+  static const uint32_t UCTX_YIELD = -1u;
+
   /**
    * @param rpc_op 调用操作符
    * @param rpc_func RPC处理函数
@@ -184,7 +186,7 @@ struct RDMAConnection {
    *  * @param length 消息大小
    *  * @param resp_data 数据返回缓冲区
    *  * @param uctx
-   * 用户协程，该字段可实现协程状态暂存，需要切换协程时返回-1（用户自行释放）
+   * 用户协程，该字段可实现协程状态暂存，需要切换协程时返回`UCTX_YIELD`（用户自行释放）
    *  * @return 数据返回大小
    */
   static void register_rpc_func(
@@ -197,7 +199,7 @@ struct RDMAConnection {
   static void register_connect_hook(
       std::function<void(RDMAConnection *conn)> &&hook_connect);
   static void register_disconnect_hook(
-      std::function<void(RDMAConnection *conn)> &&m_hook_disconnect);
+      std::function<void(RDMAConnection *conn)> &&hook_disconnect);
 
   static std::unordered_map<
       uint16_t,
@@ -279,11 +281,8 @@ struct RDMAConnection {
 };
 
 struct RDMAMsgRTCThread {
-  struct ConnContext {};
-
   struct ThreadTaskPack {
     RDMAConnection *conn;
-    RDMAMsgRTCThread::ConnContext *ctx;
     MsgBlock *msg_mb;
     void *uctx;
     uint32_t seq;
@@ -305,7 +304,7 @@ struct RDMAMsgRTCThread {
   int16_t m_core_id_;
   SpinLock m_set_lck_;
   std::thread m_th_;
-  std::vector<std::pair<RDMAConnection *, ConnContext>> m_conn_set_;
+  std::vector<RDMAConnection *> m_conn_set_;
   SpinLock m_task_queue_lck_;
   std::queue<ThreadTaskPack> m_task_queue_;
 

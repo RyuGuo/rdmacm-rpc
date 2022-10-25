@@ -121,7 +121,7 @@ RDMAMsgRTCThread::~RDMAMsgRTCThread() {
 }
 void RDMAMsgRTCThread::join_recver_conn(RDMAConnection *conn) {
   m_set_lck_.lock();
-  m_conn_set_.push_back(std::make_pair(conn, ConnContext()));
+  m_conn_set_.push_back(conn);
   m_set_lck_.unlock();
 }
 void RDMAMsgRTCThread::exit_recver_conn(RDMAConnection *conn) {
@@ -160,10 +160,7 @@ void RDMAMsgRTCThread::thread_routine() {
 
   while (!m_stop_) {
     m_set_lck_.lock();
-    for (auto &p : m_conn_set_) {
-      RDMAConnection *conn = p.first;
-      ConnContext &ctx = p.second;
-
+    for (auto &conn : m_conn_set_) {
       auto &recver = conn->m_recver_;
 
       // 1. 轮询当前msg_buf的指针指向的mb是否完成
@@ -184,7 +181,6 @@ void RDMAMsgRTCThread::thread_routine() {
 
         tps.push_back(ThreadTaskPack{
             .conn = conn,
-            .ctx = &ctx,
             .msg_mb = msg_mb,
             .uctx = nullptr,
         });

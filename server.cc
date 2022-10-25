@@ -59,14 +59,14 @@ int main() {
           *s = std::chrono::duration_cast<std::chrono::microseconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
-          return -1u;
+          return RDMAConnection::UCTX_YIELD;
         } else {
           s = *(uint64_t **)uctx;
           uint64_t e = std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::system_clock::now().time_since_epoch())
                            .count();
           if (e - *s < 10) {
-            return -1u;
+            return RDMAConnection::UCTX_YIELD;
           }
         }
         delete s;
