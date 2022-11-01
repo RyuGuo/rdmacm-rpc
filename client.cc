@@ -23,10 +23,10 @@ int main(int argc, char **argv) {
 
   ibv_mr *mr = conn.register_memory(1 << 20);
 
-  MsgQueueHandle qh;
+  RDMABatch b;
 
-  conn.prep_rpc_send(qh, 1, nullptr, 0, sizeof(p_data_t));
-  RDMAFuture t = conn.submit(qh);
+  conn.prep_rpc_send(b, 1, nullptr, 0, sizeof(p_data_t));
+  RDMAFuture t = conn.submit(b);
 
   cout << "send msg ok" << endl;
 
@@ -40,9 +40,9 @@ int main(int argc, char **argv) {
 
   {
     *(uint64_t *)mr->addr = 0;
-    conn.prep_write(qh, (uintptr_t)mr->addr, mr->lkey, 8, pdata.addr,
+    conn.prep_write(b, (uintptr_t)mr->addr, mr->lkey, 8, pdata.addr,
                     pdata.rkey);
-    RDMAFuture t = conn.submit(qh);
+    RDMAFuture t = conn.submit(b);
 
     std::vector<const void *> resp_data_ptr;
     assert(t.get(resp_data_ptr) == 0);
@@ -52,9 +52,9 @@ int main(int argc, char **argv) {
 
   {
     for (int i = 0; i < 4; ++i) {
-      conn.prep_fetch_add(qh, (uintptr_t)mr->addr, mr->lkey, pdata.addr,
+      conn.prep_fetch_add(b, (uintptr_t)mr->addr, mr->lkey, pdata.addr,
                           pdata.rkey, 1);
-      RDMAFuture t = conn.submit(qh);
+      RDMAFuture t = conn.submit(b);
 
       std::vector<const void *> resp_data_ptr;
       assert(t.get(resp_data_ptr) == 0);
@@ -64,9 +64,9 @@ int main(int argc, char **argv) {
   }
 
   {
-    conn.prep_read(qh, (uintptr_t)mr->addr, mr->lkey, 8, pdata.addr,
+    conn.prep_read(b, (uintptr_t)mr->addr, mr->lkey, 8, pdata.addr,
                    pdata.rkey);
-    RDMAFuture t = conn.submit(qh);
+    RDMAFuture t = conn.submit(b);
 
     std::vector<const void *> resp_data_ptr;
     assert(t.get(resp_data_ptr) == 0);
@@ -82,29 +82,29 @@ int main(int argc, char **argv) {
                           .count();
     for (int j = 0; j < 4; ++j) {
       ths.emplace_back([&conn]() {
-        MsgQueueHandle qh;
+        RDMABatch b;
         for (int i = 0; i < 100000; ++i) {
           int *p;
           do {
-            p = (int *)conn.prep_rpc_send_defer(qh, 2, 256, 256);
+            p = (int *)conn.prep_rpc_send_defer(b, 2, 256, 256);
           } while (p == nullptr);
           *p = i;
           conn.prep_rpc_send_confirm();
-          do {
-            p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
-          } while (p == nullptr);
-          *p = i + 1;
-          conn.prep_rpc_send_confirm();
-          RDMAFuture fu = conn.submit(qh);
+          // do {
+          //   p = (int *)conn.prep_rpc_send_defer(b, 2, sizeof(i), sizeof(int));
+          // } while (p == nullptr);
+          // *p = i + 1;
+          // conn.prep_rpc_send_confirm();
+          RDMAFuture fu = conn.submit(b);
           std::vector<const void *> resp_data_ptr;
           int rc = fu.get(resp_data_ptr);
           assert(rc == 0);
-          // assert(resp_data_ptr.size() == 1);
-          assert(resp_data_ptr.size() == 2);
+          assert(resp_data_ptr.size() == 1);
+          // assert(resp_data_ptr.size() == 2);
           assert(*(const int *)resp_data_ptr[0] == i);
-          assert(*(const int *)resp_data_ptr[1] == i + 1);
+          // assert(*(const int *)resp_data_ptr[1] == i + 1);
           conn.dealloc_resp_data(resp_data_ptr[0]);
-          conn.dealloc_resp_data(resp_data_ptr[1]);
+          // conn.dealloc_resp_data(resp_data_ptr[1]);
         }
       });
     }
@@ -124,25 +124,25 @@ int main(int argc, char **argv) {
   assert(PSIZE <= mr->length / 2);
 
   ths.clear();
-  {
+  if (0) {
     uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
                           .count();
     for (int j = 0; j < 4; ++j) {
       ths.emplace_back([&conn, mr, &pdata]() {
-        MsgQueueHandle qh;
+        RDMABatch b;
         for (int i = 0; i < 100000; ++i) {
-          conn.prep_write(qh, (uintptr_t)mr->addr, mr->lkey, PSIZE, pdata.addr,
+          conn.prep_write(b, (uintptr_t)mr->addr, mr->lkey, PSIZE, pdata.addr,
                           pdata.rkey);
-          conn.prep_write(qh, (uintptr_t)mr->addr, mr->lkey, PSIZE,
+          conn.prep_write(b, (uintptr_t)mr->addr, mr->lkey, PSIZE,
                           pdata.addr + PSIZE, pdata.rkey);
           int *p;
           do {
-            p = (int *)conn.prep_rpc_send_defer(qh, 2, sizeof(i), sizeof(int));
+            p = (int *)conn.prep_rpc_send_defer(b, 2, sizeof(i), sizeof(int));
           } while (p == nullptr);
           *p = i;
           conn.prep_rpc_send_confirm();
-          RDMAFuture fu = conn.submit(qh);
+          RDMAFuture fu = conn.submit(b);
           std::vector<const void *> resp_data_ptr;
           fu.get(resp_data_ptr);
           assert(resp_data_ptr.size() == 1);
@@ -162,24 +162,25 @@ int main(int argc, char **argv) {
   }
 
   ths.clear();
-  {
+  if (0){
     uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
                           .count();
     for (int j = 0; j < 4; ++j) {
       ths.emplace_back([&conn, mr, &pdata]() {
-        MsgQueueHandle qh;
+        RDMABatch b;
+        std::vector<const void *> resp_data_ptr;
         for (int i = 0; i < 100000; ++i) {
-          conn.prep_write(qh, (uintptr_t)mr->addr, mr->lkey, PSIZE, pdata.addr,
+          conn.prep_write(b, (uintptr_t)mr->addr, mr->lkey, PSIZE, pdata.addr,
                           pdata.rkey);
           struct {
             uint64_t addr;
             uint32_t length;
           } p = {(uintptr_t)pdata.addr, PSIZE};
-          while (conn.prep_rpc_send(qh, 3, &p, sizeof(p), 0) == -1)
+          while (conn.prep_rpc_send(b, 3, &p, sizeof(p), 0) == -1)
             ;
-          RDMAFuture fu = conn.submit(qh);
-          std::vector<const void *> resp_data_ptr;
+          RDMAFuture fu = conn.submit(b);
+          resp_data_ptr.clear();
           fu.get(resp_data_ptr);
           assert(resp_data_ptr.size() == 1);
           assert(resp_data_ptr[0] == nullptr);
@@ -198,16 +199,16 @@ int main(int argc, char **argv) {
   }
 
   ths.clear();
-  {
+  if (0){
     uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
                           .count();
     for (int j = 0; j < 4; ++j) {
       ths.emplace_back([&conn, mr, &pdata]() {
-        MsgQueueHandle qh;
+        RDMABatch b;
         for (int i = 0; i < 100000; ++i) {
-          conn.prep_rpc_send(qh, 4, nullptr, 0, 0);
-          RDMAFuture fu = conn.submit(qh);
+          conn.prep_rpc_send(b, 4, nullptr, 0, 0);
+          RDMAFuture fu = conn.submit(b);
           std::vector<const void *> resp_data_ptr;
           fu.get(resp_data_ptr);
           assert(resp_data_ptr.size() == 1);

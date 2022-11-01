@@ -91,7 +91,7 @@ struct CQHandle {
   ~CQHandle();
 };
 
-struct MsgQueueHandle {
+struct RDMABatch {
   std::vector<SgeWr> m_sge_wrs_;
   std::vector<uint32_t> m_msg_offsets_;
   std::vector<MsgBlock *> m_resp_mbs_;
@@ -143,25 +143,25 @@ struct RDMAConnection {
   ibv_mr *register_memory(void *ptr, size_t size);
   ibv_mr *register_memory(size_t size);
 
-  // prep 操作对于同一个 qh 均为 thread-unsafety
+  // prep 操作对于同一个 batch 均为 thread-unsafety
 
-  int prep_write(MsgQueueHandle &qh, uint64_t local_addr, uint32_t lkey,
+  int prep_write(RDMABatch &b, uint64_t local_addr, uint32_t lkey,
                  uint32_t length, uint64_t remote_addr, uint32_t rkey);
-  int prep_read(MsgQueueHandle &qh, uint64_t local_addr, uint32_t lkey,
+  int prep_read(RDMABatch &b, uint64_t local_addr, uint32_t lkey,
                 uint32_t length, uint64_t remote_addr, uint32_t rkey);
-  int prep_fetch_add(MsgQueueHandle &qh, uint64_t local_addr, uint32_t lkey,
+  int prep_fetch_add(RDMABatch &b, uint64_t local_addr, uint32_t lkey,
                      uint64_t remote_addr, uint32_t rkey, uint64_t n);
-  int prep_cas(MsgQueueHandle &qh, uint64_t local_addr, uint32_t lkey,
+  int prep_cas(RDMABatch &b, uint64_t local_addr, uint32_t lkey,
                uint64_t remote_addr, uint32_t rkey, uint64_t expected,
                uint64_t desired);
-  int prep_rpc_send(MsgQueueHandle &qh, uint8_t rpc_op, const void *param_data,
+  int prep_rpc_send(RDMABatch &b, uint8_t rpc_op, const void *param_data,
                     uint32_t param_data_length, uint32_t resp_data_length);
   /**
    * 准备rpc发送，返回消息buffer指针
    * 在remote_task轮询成功时自动回收
    * @warning 调用prep_rpc_send_confirm()以确认完成数据拷贝
    */
-  void *prep_rpc_send_defer(MsgQueueHandle &qh, uint8_t rpc_op,
+  void *prep_rpc_send_defer(RDMABatch &b, uint8_t rpc_op,
                             uint32_t param_data_length,
                             uint32_t resp_data_length);
   void prep_rpc_send_confirm();
@@ -170,9 +170,9 @@ struct RDMAConnection {
    * 提交prep队列
    *
    * @warning
-   *  * 该操作成功后会清空qh
+   *  * 该操作成功后会清空batch
    */
-  RDMAFuture submit(MsgQueueHandle &qh);
+  RDMAFuture submit(RDMABatch &b);
 
   void dealloc_resp_data(const void *data_ptr);
 
@@ -226,7 +226,7 @@ struct RDMAConnection {
   std::atomic<uint32_t> m_inflight_count_ = {0};
 
   SpinLock m_sending_lock_;
-  MsgQueueHandle m_msg_qh_;
+  RDMABatch m_msg_batch_;
   std::atomic<uint32_t> m_send_defer_cnt_;
 
   union {
@@ -277,7 +277,7 @@ struct RDMAConnection {
   void m_create_connection_();
   int m_poll_conn_sd_wr_();
   static int m_acknowledge_cqe_(int rc, ibv_wc wcs[]);
-  static int m_try_poll_resp_(SyncData *sd);
+  static int m_try_poll_resp_(SyncData *sd, std::vector<const void *> &resp_data_ptr);
 };
 
 struct RDMAMsgRTCThread {
