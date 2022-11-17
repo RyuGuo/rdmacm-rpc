@@ -23,7 +23,7 @@ void dealloc_task_sync_data(task_sync_data_t *tsd) {
 }
 
 RDMAThreadScheduler::RDMAThreadScheduler()
-    : m_rpt_pool_(RDMAConnection::MAX_RECVER_THREAD_COUNT, nullptr) {
+  : m_rpt_pool_(RDMAConnection::MAX_RECVER_THREAD_COUNT, nullptr) {
   for (uint8_t i = RDMAConnection::MAX_RECVER_THREAD_COUNT; i > 0; --i) {
     m_thread_waiting_pool_.push_back(i - 1);
     m_rpt_pool_[i - 1] = new RDMAMsgRTCThread(i - 1);
@@ -48,18 +48,16 @@ rdma_thread_id_t RDMAThreadScheduler::prepick_one_thread() {
   }
   return tid;
 }
-void RDMAThreadScheduler::register_conn_worker(rdma_thread_id_t tid,
-                                               RDMAConnection *conn) {
+void RDMAThreadScheduler::register_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn) {
   RDMAMsgRTCThread *&rpt = m_rpt_pool_[tid];
   rpt->join_recver_conn(conn);
 }
-void RDMAThreadScheduler::unregister_conn_worker(rdma_thread_id_t tid,
-                                                 RDMAConnection *conn) {
+void RDMAThreadScheduler::unregister_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn) {
   m_thread_waiting_pool_.push_back(tid);
   m_rpt_pool_[tid]->exit_recver_conn(conn);
 }
-void RDMAThreadScheduler::task_dispatch(
-    RDMAMsgRTCThread *rpt, std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps) {
+void RDMAThreadScheduler::task_dispatch(RDMAMsgRTCThread *rpt,
+                                        std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps) {
   if (tps.empty())
     return;
 
@@ -69,13 +67,15 @@ void RDMAThreadScheduler::task_dispatch(
   static thread_local uint32_t *to_seq_ptr = &default_tsd->to_seq;
 
   for (auto &tp : tps) {
-    tp.to_seq_ptr = to_seq_ptr;
-    tp.seq = *seq_ptr;
-    ++(*seq_ptr);
-    if (!tp.msg_mb->not_last_end) {
-      task_sync_data_t *tsd = alloc_task_sync_data();
-      seq_ptr = &tsd->seq;
-      to_seq_ptr = &tsd->to_seq;
+    if (tp.type == RDMAMsgRTCThread::ThreadTaskPack::MSG) {
+      tp.to_seq_ptr = to_seq_ptr;
+      tp.seq = *seq_ptr;
+      ++(*seq_ptr);
+      if (!tp.is_not_last) {
+        task_sync_data_t *tsd = alloc_task_sync_data();
+        seq_ptr = &tsd->seq;
+        to_seq_ptr = &tsd->to_seq;
+      }
     }
   }
 
@@ -95,7 +95,7 @@ void RDMAThreadScheduler::task_dispatch(
       ur = rng();
 
     RDMAMsgRTCThread *disp_recver =
-        m_rpt_pool_[(uint16_t)ur % RDMAConnection::MAX_RECVER_THREAD_COUNT];
+      m_rpt_pool_[(uint16_t)ur % RDMAConnection::MAX_RECVER_THREAD_COUNT];
 
     // printf("dispatch %luth task to thread %d\n", j, disp_recver->m_th_id_);
 
@@ -110,6 +110,5 @@ void RDMAThreadScheduler::task_dispatch(
 
 void RDMAThreadScheduler::flag_task_done(RDMAMsgRTCThread::ThreadTaskPack &tp) {
   dealloc_task_sync_data(
-      (task_sync_data_t *)((uint64_t)tp.to_seq_ptr -
-                           offsetof(task_sync_data_t, to_seq)));
+    (task_sync_data_t *)((uint64_t)tp.to_seq_ptr - offsetof(task_sync_data_t, to_seq)));
 }

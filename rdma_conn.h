@@ -33,6 +33,36 @@ private:
   pthread_spinlock_t spin_lck_;
 };
 
+// 多入单出内存块队列
+// * 需要类型 T 有默认构造函数
+template <typename T>
+class MpScRestrictBoundedMemPool {
+public:
+  MpScRestrictBoundedMemPool(size_t max_size)
+    : max_size_(max_size), prod_head(0), prod_tail(0), cons_head(0) {
+    mem_ = new T[max_size];
+  }
+  ~MpScRestrictBoundedMemPool() { delete[] mem_; }
+
+  bool empty() const { return prod_tail.load(std::memory_order_acquire) == cons_head; }
+  T &front() const { return mem_[cons_head % max_size_]; }
+
+  void push(const T &x) {
+    uint32_t i = prod_head.fetch_add(1, std::memory_order_acquire);
+    mem_[i % max_size_] = x;
+    while (i != prod_tail.load(std::memory_order_release)) {}
+    prod_tail.fetch_add(1, std::memory_order_release);
+  }
+
+  void pop() { ++cons_head; }
+
+private:
+  size_t max_size_;
+  T *mem_;
+  std::atomic<uint32_t> prod_head, prod_tail;
+  __attribute__((aligned(64))) uint32_t cons_head;
+};
+
 class RDMAEnv {
 public:
   RDMAEnv(const RDMAEnv &) = delete;
@@ -75,9 +105,7 @@ struct MsgBlock {
   static uint32_t msg_min_size() { return sizeof(MsgBlock); }
   uint32_t msg_size() const { return sizeof(MsgBlock) + size; }
   void set_complete_byte() { data[size] = 1; }
-  bool valid() const {
-    return notify && __atomic_load_n(&data[size], __ATOMIC_RELAXED) == 1;
-  }
+  bool valid() const { return notify && __atomic_load_n(&data[size], __ATOMIC_RELAXED) == 1; }
 };
 
 struct SgeWr {
@@ -85,10 +113,26 @@ struct SgeWr {
   ibv_send_wr wr;
 };
 
+struct SgeRecvWr {
+  ibv_sge sge;
+  ibv_recv_wr wr;
+};
+
 struct CQHandle {
   std::map<ibv_context *, ibv_cq *> m_cq_map_;
   SpinLock m_cq_lck_;
   ~CQHandle();
+};
+
+struct SRQHandle {
+  std::map<ibv_context *, ibv_srq *> m_srq_map_;
+  SpinLock m_srq_lck_;
+  ~SRQHandle();
+};
+
+struct RecvBlockInfo {
+  ibv_mr *recv_block_mr;
+  MpScRestrictBoundedMemPool<void *> *free_recv_block_pool;
 };
 
 struct RDMABatch {
@@ -129,6 +173,9 @@ struct RDMAConnection {
   static uint32_t MAX_MESSAGE_BUFFER_SIZE;
   static uint32_t MSG_INLINE_THRESHOLD;
   static uint8_t MAX_RECVER_THREAD_COUNT;
+  static uint32_t MAX_RECV_BUFFER_SIZE;
+  static uint8_t MAX_RECV_BUFFER_CNT;
+  static uint32_t MAX_SRQ_WR;
   static std::vector<int16_t> VEC_RECVER_THREAD_BIND_CORE;
 
   RDMAConnection(CQHandle *cq_handle = nullptr, bool rpc_conn = true);
@@ -142,18 +189,21 @@ struct RDMAConnection {
 
   ibv_mr *register_memory(void *ptr, size_t size);
   ibv_mr *register_memory(size_t size);
+  ibv_mr *register_device_memory(size_t size);
 
   // prep 操作对于同一个 batch 均为 thread-unsafety
 
-  int prep_write(RDMABatch &b, uint64_t local_addr, uint32_t lkey,
-                 uint32_t length, uint64_t remote_addr, uint32_t rkey);
-  int prep_read(RDMABatch &b, uint64_t local_addr, uint32_t lkey,
-                uint32_t length, uint64_t remote_addr, uint32_t rkey);
-  int prep_fetch_add(RDMABatch &b, uint64_t local_addr, uint32_t lkey,
-                     uint64_t remote_addr, uint32_t rkey, uint64_t n);
-  int prep_cas(RDMABatch &b, uint64_t local_addr, uint32_t lkey,
-               uint64_t remote_addr, uint32_t rkey, uint64_t expected,
-               uint64_t desired);
+  int prep_write(RDMABatch &b, uint64_t local_addr, uint32_t lkey, uint32_t length,
+                 uint64_t remote_addr, uint32_t rkey);
+  int prep_read(RDMABatch &b, uint64_t local_addr, uint32_t lkey, uint32_t length,
+                uint64_t remote_addr, uint32_t rkey);
+  int prep_fetch_add(RDMABatch &b, uint64_t local_addr, uint32_t lkey, uint64_t remote_addr,
+                     uint32_t rkey, uint64_t n);
+  int prep_cas(RDMABatch &b, uint64_t local_addr, uint32_t lkey, uint64_t remote_addr,
+               uint32_t rkey, uint64_t expected, uint64_t desired);
+  int prep_write_imm(RDMABatch &b, uint64_t local_addr, uint32_t lkey, uint32_t length,
+                     uint32_t imm_data, uint64_t remote_addr, uint32_t rkey);
+  int prep_send(RDMABatch &b, uint64_t local_addr, uint32_t lkey, uint32_t length);
   int prep_rpc_send(RDMABatch &b, uint8_t rpc_op, const void *param_data,
                     uint32_t param_data_length, uint32_t resp_data_length);
   /**
@@ -161,8 +211,7 @@ struct RDMAConnection {
    * 在remote_task轮询成功时自动回收
    * @warning 调用prep_rpc_send_confirm()以确认完成数据拷贝
    */
-  void *prep_rpc_send_defer(RDMABatch &b, uint8_t rpc_op,
-                            uint32_t param_data_length,
+  void *prep_rpc_send_defer(RDMABatch &b, uint8_t rpc_op, uint32_t param_data_length,
                             uint32_t resp_data_length);
   void prep_rpc_send_confirm();
 
@@ -190,40 +239,58 @@ struct RDMAConnection {
    *  * @return 数据返回大小
    */
   static void register_rpc_func(
-      uint16_t rpc_op,
-      std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
-                             uint32_t length, void *resp_data,
-                             uint32_t max_resp_data_length, void **uctx)>
-          &&rpc_func);
+    uint16_t rpc_op,
+    std::function<uint32_t(RDMAConnection *conn, void *msg_data, uint32_t length, void *resp_data,
+                           uint32_t max_resp_data_length, void **uctx)> &&rpc_func);
 
-  static void register_connect_hook(
-      std::function<void(RDMAConnection *conn)> &&hook_connect);
-  static void register_disconnect_hook(
-      std::function<void(RDMAConnection *conn)> &&hook_disconnect);
+  static void register_rdma_write_with_imm_handle(
+    std::function<uint32_t(RDMAConnection *conn, uint32_t write_imm_data, void **uctx)>
+      &&write_with_imm_handle);
+  static void register_rdma_send_handle(
+    std::function<uint32_t(RDMAConnection *conn, void *send_data, uint32_t length, void **uctx)>
+      &&rdma_send_handle);
+
+  static void register_connect_hook(std::function<void(RDMAConnection *conn)> &&hook_connect);
+  static void register_disconnect_hook(std::function<void(RDMAConnection *conn)> &&hook_disconnect);
 
   static std::unordered_map<
-      uint16_t,
-      std::function<uint32_t(RDMAConnection *conn, const void *msg_data,
-                             uint32_t length, void *resp_data,
-                             uint32_t max_resp_data_length, void **uctx)>>
-      m_rpc_exec_map_;
+    uint16_t, std::function<uint32_t(RDMAConnection *conn, void *msg_data, uint32_t length,
+                                     void *resp_data, uint32_t max_resp_data_length, void **uctx)>>
+    m_rpc_handle_map_;
+
+  static std::function<uint32_t(RDMAConnection *conn, uint32_t write_imm_data, void **uctx)>
+    m_write_with_imm_handle_;
+  static std::function<uint32_t(RDMAConnection *conn, void *send_data, uint32_t length,
+                                void **uctx)>
+    m_rdma_send_handle_;
 
   static std::function<void(RDMAConnection *conn)> m_hook_connect_;
   static std::function<void(RDMAConnection *conn)> m_hook_disconnect_;
 
   static SpinLock m_core_bind_lock_;
 
+  enum conn_type_t {
+    SENDER,
+    RECVER,
+    LISTENER,
+  };
+
+  uint8_t conn_type;
   volatile bool m_stop_;
   bool m_rpc_conn_;
   bool m_atomic_support_;
   bool m_inline_support_;
+  std::atomic<uint32_t> m_inflight_count_ = {0}; // 与 m_sending_lock_ 间隔 >64B
   ibv_comp_channel *m_comp_chan_;
   rdma_cm_id *m_cm_id_;
   ibv_pd *m_pd_;
   ibv_cq *m_cq_;
+  ibv_cq *m_recv_cq_;
+  ibv_srq *m_srq_;
+  ibv_dm *m_dm_;
   CQHandle *m_cq_handle_;
-  std::thread *m_conn_handler_;
-  std::atomic<uint32_t> m_inflight_count_ = {0};
+  CQHandle *m_recv_cq_handle_;
+  SRQHandle *m_srq_handle_;
 
   SpinLock m_sending_lock_;
   RDMABatch m_msg_batch_;
@@ -245,6 +312,7 @@ struct RDMAConnection {
       uint32_t m_msg_head_;
       uint32_t m_resp_head_;
       ibv_mr *m_msg_buf_;
+      // copied by m_msg_buf_, use `new` and `delete` to manage life cycle
       ibv_mr *m_resp_buf_;
 
       uint64_t m_peer_msg_buf_addr_;
@@ -262,41 +330,60 @@ struct RDMAConnection {
       uint32_t m_msg_head_;
       uint32_t m_resp_head_;
       ibv_mr *m_msg_buf_;
+      // copied by m_msg_buf_, use `new` and `delete` to manage life cycle
       ibv_mr *m_resp_buf_;
 
       uint64_t m_peer_resp_buf_addr_;
       uint32_t m_peer_resp_buf_rkey_;
 
       uint32_t m_matched_buf_size_;
+
+      ibv_mr *m_recv_block_mr_;
+      MpScRestrictBoundedMemPool<void *> *m_free_recv_block_queue_;
     } m_recver_;
+    struct {
+      std::thread *m_conn_handler_;
+      std::map<ibv_pd *, std::vector<RecvBlockInfo>> *m_recv_block_pool_;
+    };
   };
 
   bool m_rdma_conn_param_valid_();
-  int m_create_ibv_connection_();
+  int m_init_ibv_connection_();
   void m_handle_connection_();
-  void m_create_connection_();
   int m_poll_conn_sd_wr_();
-  static int m_acknowledge_cqe_(int rc, ibv_wc wcs[]);
+  uint32_t m_msg_handle_(RDMAConnection *self, MsgBlock *msg_mb, void **uctx);
+  static int m_acknowledge_sd_cqe_(int rc, ibv_wc wcs[]);
   static int m_try_poll_resp_(SyncData *sd, std::vector<const void *> &resp_data_ptr);
+
+  void m_init_connection_(RDMAConnection *init_conn);
 };
 
 struct RDMAMsgRTCThread {
   struct ThreadTaskPack {
+    enum type_t {
+      MSG,
+      WRITE_IMM,
+      SEND,
+    };
     RDMAConnection *conn;
-    MsgBlock *msg_mb;
     void *uctx;
-    uint32_t seq;
-    uint32_t *to_seq_ptr;
-  };
-
-  struct ThreadTaskQueue {
-    void push(ThreadTaskPack *tps, size_t n);
-    bool pop(ThreadTaskPack *tp);
-
-    ThreadTaskQueue();
-    ~ThreadTaskQueue();
-
-    void *q;
+    int type;
+    union {
+      struct {
+        MsgBlock *msg_mb;
+        bool is_not_last;
+        uint32_t seq;
+        uint32_t *to_seq_ptr;
+      };
+      struct {
+        void *invalidate_data;
+        uint32_t write_imm_data;
+      };
+      struct {
+        void *send_data;
+        uint32_t length;
+      };
+    };
   };
 
   volatile bool m_stop_;
@@ -307,6 +394,10 @@ struct RDMAMsgRTCThread {
   std::vector<RDMAConnection *> m_conn_set_;
   SpinLock m_task_queue_lck_;
   std::queue<ThreadTaskPack> m_task_queue_;
+  std::unordered_map<uint32_t, RDMAConnection *> m_qp_conn_map_;
+
+  std::vector<ThreadTaskPack> m_tps_;
+  std::vector<ThreadTaskPack> m_uctx_tps_;
 
   RDMAMsgRTCThread(rdma_thread_id_t tid);
   ~RDMAMsgRTCThread();
@@ -314,6 +405,8 @@ struct RDMAMsgRTCThread {
   void exit_recver_conn(RDMAConnection *conn);
   void thread_routine();
   void core_bind();
+  void poll_msg(RDMAConnection *conn);
+  void poll_recv_task(RDMAConnection *represent_conn);
 };
 
 class RDMAThreadScheduler {
@@ -331,8 +424,7 @@ public:
   rdma_thread_id_t prepick_one_thread();
   void register_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
   void unregister_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
-  void task_dispatch(RDMAMsgRTCThread *rpt,
-                     std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps);
+  void task_dispatch(RDMAMsgRTCThread *rpt, std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps);
   void flag_task_done(RDMAMsgRTCThread::ThreadTaskPack &tp);
 
 private:
