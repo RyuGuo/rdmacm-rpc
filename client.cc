@@ -268,11 +268,11 @@ int main(int argc, char **argv) {
         std::vector<const void *> resp_data_ptr;
         srand(tid);
         char rpc_data[128];
-        for (int i = 0; i < 10000; ++i) {
+        for (int i = 0; i < 100000; ++i) {
           int kr = rand() % 4;
           int rpc_cnt = 0;
           for (int k = 0; k < kr; ++k) {
-            int r = rand() % (2 + 5 + 5 + 1 + 1 + 1 + 1);
+            int r = rand() % (2 + 5 + 5 + 1 + 1 + 1);
             if (r < 2) {
               int s = rand() % 127 + 1;
               conn.prep_rpc_send(b, 2, rpc_data, s, s);
@@ -291,9 +291,6 @@ int main(int argc, char **argv) {
               int s = rand() % pdata.length;
               conn.prep_write_imm(b, (uintptr_t)mr->addr, mr->lkey, s, 0x123, pdata.addr,
                                   pdata.rkey);
-            } else if (r < 2 + 5 + 5 + 1 + 1 + 1 + 1) {
-              int s = 128;
-              conn.prep_send(b, (uintptr_t)mr->addr, mr->lkey, s);
             }
           }
 
@@ -312,6 +309,12 @@ int main(int argc, char **argv) {
     }
 
     cout << "functional test ok" << endl;
+  }
+
+  {
+    // stop server
+    conn.prep_rpc_send(b, 5, nullptr, 0, 0);
+    conn.submit(b);
   }
 
   return 0;

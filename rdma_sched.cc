@@ -84,13 +84,11 @@ void RDMAThreadScheduler::task_dispatch(RDMAMsgRTCThread *rpt,
   // printf("dispatch %luth task to thread %d\n", 0lu, rpt->m_th_id_);
 
   // 这里将第一个task放在当前线程中执行
-  rpt->m_task_queue_lck_.lock();
-  rpt->m_task_queue_.emplace(tps.front());
-  rpt->m_task_queue_lck_.unlock();
+  rpt->m_task_queue_.enqueue(tps.front());
 
   int i = 0;
   uint64_t ur = 0;
-  for (size_t j = 1; j < tps.size(); ++j) {
+  for (size_t j = 1; j < tps.size(); ++j, ++i) {
     if (!(i & (sizeof(ur) / sizeof(rdma_thread_id_t) - 1)))
       ur = rng();
 
@@ -99,12 +97,9 @@ void RDMAThreadScheduler::task_dispatch(RDMAMsgRTCThread *rpt,
 
     // printf("dispatch %luth task to thread %d\n", j, disp_recver->m_th_id_);
 
-    disp_recver->m_task_queue_lck_.lock();
-    disp_recver->m_task_queue_.emplace(tps[j]);
-    disp_recver->m_task_queue_lck_.unlock();
+    disp_recver->m_task_queue_.enqueue(tps[j]);
 
     ur >>= sizeof(rdma_thread_id_t) * 8;
-    ++i;
   }
 }
 

@@ -19,8 +19,6 @@ std::unordered_map<
 
 std::function<uint32_t(RDMAConnection *conn, uint32_t write_imm_data, void **uctx)>
   RDMAConnection::m_write_with_imm_handle_;
-std::function<uint32_t(RDMAConnection *conn, void *send_data, uint32_t length, void **uctx)>
-  RDMAConnection::m_rdma_send_handle_;
 
 template <typename Dur>
 uint64_t get_wall_time() {
@@ -110,14 +108,6 @@ void RDMAConnection::register_rdma_write_with_imm_handle(
     write_with_imm_handle);
 }
 
-void RDMAConnection::register_rdma_send_handle(
-  std::function<uint32_t(RDMAConnection *conn, void *send_data, uint32_t length, void **uctx)>
-    &&rdma_send_handle) {
-  m_rdma_send_handle_ = std::forward<
-    std::function<uint32_t(RDMAConnection * conn, void *send_data, uint32_t length, void **uctx)>>(
-    rdma_send_handle);
-}
-
 SpinLock RDMAConnection::m_core_bind_lock_;
 
 RDMAMsgRTCThread::RDMAMsgRTCThread(rdma_thread_id_t tid)
@@ -188,70 +178,48 @@ void RDMAMsgRTCThread::thread_routine() {
     RDMAThreadScheduler::get_instance().task_dispatch(this, m_tps_);
 
     if (!m_uctx_tps_.empty()) {
-      m_task_queue_lck_.lock();
-      for (auto &tp : m_uctx_tps_) {
-        m_task_queue_.push(tp);
-      }
+      m_task_queue_.enqueue_bulk(m_uctx_tps_.begin(), m_uctx_tps_.size());
       m_uctx_tps_.clear();
-      goto go_queue_next;
     }
-    if (!m_task_queue_.empty()) {
-      m_task_queue_lck_.lock();
-    go_queue_next:
-      while (!m_task_queue_.empty()) {
-        ThreadTaskPack tp = m_task_queue_.front();
-        m_task_queue_.pop();
-        m_task_queue_lck_.unlock();
-        RDMAConnection *conn = tp.conn;
 
-        switch (tp.type) {
-        case ThreadTaskPack::MSG: {
-          uint32_t ret = conn->m_msg_handle_(conn, tp.msg_mb, &tp.uctx);
-          if (ret == RDMAConnection::UCTX_YIELD) {
-            m_uctx_tps_.push_back(tp);
-            goto contin;
-          }
+    ThreadTaskPack tp;
+    while (m_task_queue_.try_dequeue(tp)) {
+      RDMAConnection *conn = tp.conn;
 
-          // 如果不是必要的立即返回（batch
-          // rpc，且有些rpc不需要立即返回），可以暂时等待后面的rpc完成
-          if (!tp.is_not_last) {
-            // 这里的等待保证wr与resp msg addr的排序一致，最大程度起到batch作用
-            while (__atomic_load_n(tp.to_seq_ptr, __ATOMIC_RELAXED) != tp.seq) {
-              std::this_thread::yield();
-            }
-            // printf("[%u] send resp clear\n", m_th_id_);
-            conn->submit(void_batch);
-            // 那些需要返回消息的tp作为flag task进行回收资源
-            RDMAThreadScheduler::get_instance().flag_task_done(tp);
-          } else {
-            __atomic_fetch_add(tp.to_seq_ptr, 1, __ATOMIC_RELEASE);
-          }
-
-          // 清空消息buf
-          memset(tp.msg_mb, 0, ret);
-        } break;
-        case ThreadTaskPack::WRITE_IMM: {
-          uint32_t ret = conn->m_write_with_imm_handle_(conn, tp.write_imm_data, &tp.uctx);
-          if (ret == RDMAConnection::UCTX_YIELD) {
-            m_uctx_tps_.push_back(tp);
-            goto contin;
-          }
-          conn->m_recver_.m_free_recv_block_queue_->push(tp.invalidate_data);
-        } break;
-        case ThreadTaskPack::SEND: {
-          uint32_t ret = conn->m_rdma_send_handle_(conn, tp.send_data, tp.length, &tp.uctx);
-          if (ret == RDMAConnection::UCTX_YIELD) {
-            m_uctx_tps_.push_back(tp);
-            goto contin;
-          }
-          conn->m_recver_.m_free_recv_block_queue_->push(tp.send_data);
-        } break;
+      switch (tp.type) {
+      case ThreadTaskPack::MSG: {
+        uint32_t ret = conn->m_msg_handle_(conn, tp.msg_mb, &tp.uctx);
+        if (ret == RDMAConnection::UCTX_YIELD) {
+          m_uctx_tps_.push_back(tp);
+          continue;
         }
 
-      contin:
-        m_task_queue_lck_.lock();
+        // 如果不是必要的立即返回（batch
+        // rpc，且有些rpc不需要立即返回），可以暂时等待后面的rpc完成
+        if (!tp.is_not_last) {
+          // 这里的等待保证wr与resp msg addr的排序一致，最大程度起到batch作用
+          while (__atomic_load_n(tp.to_seq_ptr, __ATOMIC_RELAXED) != tp.seq) {
+            std::this_thread::yield();
+          }
+          // printf("[%u] send resp clear\n", m_th_id_);
+          conn->submit(void_batch);
+          // 那些需要返回消息的tp作为flag task进行回收资源
+          RDMAThreadScheduler::get_instance().flag_task_done(tp);
+        } else {
+          __atomic_fetch_add(tp.to_seq_ptr, 1, __ATOMIC_RELEASE);
+        }
+
+        // 清空消息buf
+        memset(tp.msg_mb, 0, ret);
+      } break;
+      case ThreadTaskPack::WRITE_IMM: {
+        uint32_t ret = conn->m_write_with_imm_handle_(conn, tp.write_imm_data, &tp.uctx);
+        if (ret == RDMAConnection::UCTX_YIELD) {
+          m_uctx_tps_.push_back(tp);
+          continue;
+        }
+      } break;
       }
-      m_task_queue_lck_.unlock();
     }
 
     m_set_lck_.unlock();
@@ -492,22 +460,6 @@ int RDMAConnection::prep_write_imm(RDMABatch &b, uint64_t local_addr, uint32_t l
   return 0;
 }
 
-int RDMAConnection::prep_send(RDMABatch &b, uint64_t local_addr, uint32_t lkey, uint32_t length) {
-  if (__glibc_unlikely(!m_rpc_conn_)) {
-    errno = EPERM;
-    perror("non rpc_conn can't send");
-    return -1;
-  }
-
-  b.m_sge_wrs_.push_back(
-    {ibv_sge{.addr = local_addr, .length = length, .lkey = lkey}, ibv_send_wr{
-                                                                    .num_sge = 1,
-                                                                    .opcode = IBV_WR_SEND,
-                                                                  }});
-
-  return 0;
-}
-
 int RDMAConnection::prep_rpc_send(RDMABatch &b, uint8_t rpc_op, const void *param_data,
                                   uint32_t param_data_length, uint32_t resp_data_length) {
   void *msg_buf = prep_rpc_send_defer(b, rpc_op, param_data_length, resp_data_length);
@@ -534,6 +486,19 @@ RDMAFuture RDMAConnection::submit(RDMABatch &b) {
 
   SyncData *sd = alloc_sync_data();
   sd->conn = this;
+  sd->resp_poll_idx = 0;
+  sd->timeout = false;
+
+  sd->msg_offsets.swap(b.m_msg_offsets_);
+  sd->resp_mbs.swap(b.m_resp_mbs_);
+
+  for (size_t i = 0; i < sge_wrs.size(); ++i) {
+    sge_wrs[i].wr.sg_list = &sge_wrs[i].sge;
+    sge_wrs[i].wr.next = &sge_wrs[i + 1].wr;
+
+    // printf("send %#lx to %#lx\n", sge_wrs[i].sge.addr,
+    //        sge_wrs[i].wr.wr.rdma.remote_addr);
+  }
 
   m_sending_lock_.lock();
 
@@ -544,22 +509,11 @@ RDMAFuture RDMAConnection::submit(RDMABatch &b) {
     std::this_thread::yield();
     m_sending_lock_.lock();
   }
-  sd->msg_offsets.swap(b.m_msg_offsets_);
-  sd->resp_mbs.swap(b.m_resp_mbs_);
+
   msg_sge_wrs.swap(m_msg_batch_.m_sge_wrs_);
 
   m_sending_lock_.unlock();
 
-  sd->resp_poll_idx = 0;
-  sd->timeout = false;
-
-  for (size_t i = 0; i < sge_wrs.size(); ++i) {
-    sge_wrs[i].wr.sg_list = &sge_wrs[i].sge;
-    sge_wrs[i].wr.next = &sge_wrs[i + 1].wr;
-
-    // printf("send %#lx to %#lx\n", sge_wrs[i].sge.addr,
-    //        sge_wrs[i].wr.wr.rdma.remote_addr);
-  }
   for (size_t i = 0; i < msg_sge_wrs.size(); ++i) {
     msg_sge_wrs[i].wr.sg_list = &msg_sge_wrs[i].sge;
     msg_sge_wrs[i].wr.next = &msg_sge_wrs[i + 1].wr;
@@ -611,7 +565,8 @@ RDMAFuture RDMAConnection::submit(RDMABatch &b) {
 
   if (combined_wr_size == 0) {
     sd->wc_finish = true;
-    sd->now_ms = get_wall_time<std::chrono::milliseconds>();
+    if (RDMAConnection::RDMA_TIMEOUT_ENABLE)
+      sd->now_ms = get_wall_time<std::chrono::milliseconds>();
     return fu;
   }
 
@@ -652,7 +607,8 @@ RDMAFuture RDMAConnection::submit(RDMABatch &b) {
   //          wp->wr.rdma.remote_addr);
   // }
 
-  sd->now_ms = get_wall_time<std::chrono::milliseconds>();
+  if (RDMAConnection::RDMA_TIMEOUT_ENABLE)
+    sd->now_ms = get_wall_time<std::chrono::milliseconds>();
 
   struct ibv_send_wr *bad_send_wr;
   if (__glibc_unlikely(ibv_post_send(m_cm_id_->qp, wr_head, &bad_send_wr) != 0)) {
@@ -687,6 +643,29 @@ need_retry:
 
   fu.m_sd_ = nullptr;
   return fu;
+}
+
+void RDMAConnection::m_post_srq_wr(ibv_srq *srq, int count) {
+  if (count == 0)
+    return;
+
+  static thread_local std::vector<SgeRecvWr> sge_wr;
+  sge_wr.resize(count);
+  ibv_recv_wr *bad_wr;
+
+  for (int i = 0; i < count; ++i) {
+    auto &sge_wr_ = sge_wr[i];
+
+    sge_wr_ = {};
+    sge_wr_.wr.sg_list = &sge_wr_.sge;
+    sge_wr_.wr.num_sge = 1;
+    sge_wr_.wr.next = &sge_wr[i + 1].wr;
+  }
+  sge_wr.back().wr.next = nullptr;
+  if (__glibc_unlikely(ibv_post_srq_recv(srq, &sge_wr.front().wr, &bad_wr)) != 0) {
+    perror("ibv_post_srq_recv fail");
+    return;
+  }
 }
 
 int RDMAConnection::m_acknowledge_sd_cqe_(int rc, ibv_wc wcs[]) {
@@ -738,13 +717,15 @@ int RDMAFuture::try_get(std::vector<const void *> &resp_data_ptr) {
     return 0;
   }
 
-  // 超时检测
-  uint32_t now = get_wall_time<std::chrono::milliseconds>();
-  if (__glibc_unlikely(now - m_sd_->now_ms > RDMAConnection::RDMA_TIMEOUT_MS)) {
-    m_sd_->timeout = true;
-    errno = ETIMEDOUT;
-    perror("rdma task timeout");
-    return -1;
+  if (RDMAConnection::RDMA_TIMEOUT_ENABLE) {
+    // 超时检测
+    uint32_t now = get_wall_time<std::chrono::milliseconds>();
+    if (__glibc_unlikely(now - m_sd_->now_ms > RDMAConnection::RDMA_TIMEOUT_MS)) {
+      m_sd_->timeout = true;
+      errno = ETIMEDOUT;
+      perror("rdma task timeout");
+      return -1;
+    }
   }
 
   return 1;
@@ -793,6 +774,7 @@ int RDMAConnection::m_try_poll_resp_(SyncData *sd, std::vector<const void *> &re
 }
 
 int RDMAFuture::get(std::vector<const void *> &resp_data_ptr) {
+  resp_data_ptr.reserve(m_sd_->resp_mbs.size());
   while (1) {
     int ret = try_get(resp_data_ptr);
     if (ret == 0) {
@@ -878,15 +860,9 @@ void RDMAMsgRTCThread::poll_recv_task(RDMAConnection *represent_conn) {
       ThreadTaskPack new_tp = {};
       new_tp.conn = conn_it->second;
       new_tp.uctx = nullptr;
-      if (wc.wc_flags & IBV_WC_WITH_IMM) {
-        new_tp.type = ThreadTaskPack::WRITE_IMM;
-        new_tp.write_imm_data = wc.imm_data;
-        new_tp.invalidate_data = (void *)wc.wr_id;
-      } else {
-        new_tp.type = ThreadTaskPack::SEND;
-        new_tp.send_data = (void *)wc.wr_id;
-        new_tp.length = wc.byte_len;
-      }
+      new_tp.type = ThreadTaskPack::WRITE_IMM;
+      new_tp.write_imm_data = wc.imm_data;
+      new_tp.invalidate_data = (void *)wc.wr_id;
       m_tps_.emplace_back(new_tp);
     } else {
       fprintf(stderr, "cmd_recv status error: %s\n", ibv_wc_status_str(wc.status));
@@ -894,43 +870,5 @@ void RDMAMsgRTCThread::poll_recv_task(RDMAConnection *represent_conn) {
     }
   }
 
-  int try_addition_cnt =
-    std::min((uint32_t)m_conn_set_.size() * RDMAConnection::MAX_RECV_BUFFER_CNT,
-             RDMAConnection::MAX_SRQ_WR)
-    - (uint64_t)(represent_conn->m_srq_->srq_context);
-  if (try_addition_cnt > 0) {
-    static thread_local std::vector<SgeRecvWr> sge_wr;
-    sge_wr.resize(try_addition_cnt);
-    ibv_recv_wr *bad_wr;
-
-    int addition_cnt;
-    for (addition_cnt = 0; addition_cnt < try_addition_cnt
-                           && !represent_conn->m_recver_.m_free_recv_block_queue_->empty();
-         ++addition_cnt) {
-      void *block_addr = represent_conn->m_recver_.m_free_recv_block_queue_->front();
-      represent_conn->m_recver_.m_free_recv_block_queue_->pop();
-
-      auto &sge_wr_ = sge_wr[addition_cnt];
-
-      sge_wr_.sge.addr = (uintptr_t)block_addr;
-      sge_wr_.sge.length = RDMAConnection::MAX_RECV_BUFFER_SIZE;
-      sge_wr_.sge.lkey = represent_conn->m_recver_.m_recv_block_mr_->lkey;
-
-      sge_wr_.wr.sg_list = &sge_wr_.sge;
-      sge_wr_.wr.num_sge = 1;
-      sge_wr_.wr.wr_id = (uintptr_t)block_addr;
-      sge_wr_.wr.next = &sge_wr[addition_cnt + 1].wr;
-    }
-    if (addition_cnt > 0) {
-      sge_wr.resize(addition_cnt);
-      sge_wr.back().wr.next = nullptr;
-      if (__glibc_unlikely(ibv_post_srq_recv(represent_conn->m_srq_, &sge_wr.front().wr, &bad_wr))
-          != 0) {
-        perror("ibv_post_srq_recv fail");
-        return;
-      }
-    }
-
-    (uint64_t &)(represent_conn->m_srq_->srq_context) += addition_cnt;
-  }
+  represent_conn->m_post_srq_wr(represent_conn->m_srq_, rc);
 }

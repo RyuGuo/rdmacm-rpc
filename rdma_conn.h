@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "moodycamel.h"
 
 // rdma_event_channel 对应一个 epoll event channel
 // rdma_id -->  ctx  --> cq
@@ -31,36 +32,6 @@ public:
 
 private:
   pthread_spinlock_t spin_lck_;
-};
-
-// 多入单出内存块队列
-// * 需要类型 T 有默认构造函数
-template <typename T>
-class MpScRestrictBoundedMemPool {
-public:
-  MpScRestrictBoundedMemPool(size_t max_size)
-    : max_size_(max_size), prod_head(0), prod_tail(0), cons_head(0) {
-    mem_ = new T[max_size];
-  }
-  ~MpScRestrictBoundedMemPool() { delete[] mem_; }
-
-  bool empty() const { return prod_tail.load(std::memory_order_acquire) == cons_head; }
-  T &front() const { return mem_[cons_head % max_size_]; }
-
-  void push(const T &x) {
-    uint32_t i = prod_head.fetch_add(1, std::memory_order_acquire);
-    mem_[i % max_size_] = x;
-    while (i != prod_tail.load(std::memory_order_release)) {}
-    prod_tail.fetch_add(1, std::memory_order_release);
-  }
-
-  void pop() { ++cons_head; }
-
-private:
-  size_t max_size_;
-  T *mem_;
-  std::atomic<uint32_t> prod_head, prod_tail;
-  __attribute__((aligned(64))) uint32_t cons_head;
 };
 
 class RDMAEnv {
@@ -132,7 +103,7 @@ struct SRQHandle {
 
 struct RecvBlockInfo {
   ibv_mr *recv_block_mr;
-  MpScRestrictBoundedMemPool<void *> *free_recv_block_pool;
+  moodycamel::ConcurrentQueue<void *> *free_recv_block_pool;
 };
 
 struct RDMABatch {
@@ -169,14 +140,13 @@ struct RDMAConnection {
   static uint8_t INITIATOR_DEPTH;
   static int RESPONDER_RESOURCES;
   static int POLL_ENTRY_COUNT;
-  static uint32_t RDMA_TIMEOUT_MS;
   static uint32_t MAX_MESSAGE_BUFFER_SIZE;
   static uint32_t MSG_INLINE_THRESHOLD;
   static uint8_t MAX_RECVER_THREAD_COUNT;
-  static uint32_t MAX_RECV_BUFFER_SIZE;
-  static uint8_t MAX_RECV_BUFFER_CNT;
   static uint32_t MAX_SRQ_WR;
   static std::vector<int16_t> VEC_RECVER_THREAD_BIND_CORE;
+  static bool RDMA_TIMEOUT_ENABLE;
+  static uint32_t RDMA_TIMEOUT_MS;
 
   RDMAConnection(CQHandle *cq_handle = nullptr, bool rpc_conn = true);
   ~RDMAConnection();
@@ -203,7 +173,6 @@ struct RDMAConnection {
                uint32_t rkey, uint64_t expected, uint64_t desired);
   int prep_write_imm(RDMABatch &b, uint64_t local_addr, uint32_t lkey, uint32_t length,
                      uint32_t imm_data, uint64_t remote_addr, uint32_t rkey);
-  int prep_send(RDMABatch &b, uint64_t local_addr, uint32_t lkey, uint32_t length);
   int prep_rpc_send(RDMABatch &b, uint8_t rpc_op, const void *param_data,
                     uint32_t param_data_length, uint32_t resp_data_length);
   /**
@@ -246,9 +215,6 @@ struct RDMAConnection {
   static void register_rdma_write_with_imm_handle(
     std::function<uint32_t(RDMAConnection *conn, uint32_t write_imm_data, void **uctx)>
       &&write_with_imm_handle);
-  static void register_rdma_send_handle(
-    std::function<uint32_t(RDMAConnection *conn, void *send_data, uint32_t length, void **uctx)>
-      &&rdma_send_handle);
 
   static void register_connect_hook(std::function<void(RDMAConnection *conn)> &&hook_connect);
   static void register_disconnect_hook(std::function<void(RDMAConnection *conn)> &&hook_disconnect);
@@ -260,9 +226,6 @@ struct RDMAConnection {
 
   static std::function<uint32_t(RDMAConnection *conn, uint32_t write_imm_data, void **uctx)>
     m_write_with_imm_handle_;
-  static std::function<uint32_t(RDMAConnection *conn, void *send_data, uint32_t length,
-                                void **uctx)>
-    m_rdma_send_handle_;
 
   static std::function<void(RDMAConnection *conn)> m_hook_connect_;
   static std::function<void(RDMAConnection *conn)> m_hook_disconnect_;
@@ -337,13 +300,9 @@ struct RDMAConnection {
       uint32_t m_peer_resp_buf_rkey_;
 
       uint32_t m_matched_buf_size_;
-
-      ibv_mr *m_recv_block_mr_;
-      MpScRestrictBoundedMemPool<void *> *m_free_recv_block_queue_;
     } m_recver_;
     struct {
       std::thread *m_conn_handler_;
-      std::map<ibv_pd *, std::vector<RecvBlockInfo>> *m_recv_block_pool_;
     };
   };
 
@@ -354,6 +313,7 @@ struct RDMAConnection {
   uint32_t m_msg_handle_(RDMAConnection *self, MsgBlock *msg_mb, void **uctx);
   static int m_acknowledge_sd_cqe_(int rc, ibv_wc wcs[]);
   static int m_try_poll_resp_(SyncData *sd, std::vector<const void *> &resp_data_ptr);
+  static void m_post_srq_wr(ibv_srq *srq, int count);
 
   void m_init_connection_(RDMAConnection *init_conn);
 };
@@ -363,7 +323,6 @@ struct RDMAMsgRTCThread {
     enum type_t {
       MSG,
       WRITE_IMM,
-      SEND,
     };
     RDMAConnection *conn;
     void *uctx;
@@ -379,10 +338,6 @@ struct RDMAMsgRTCThread {
         void *invalidate_data;
         uint32_t write_imm_data;
       };
-      struct {
-        void *send_data;
-        uint32_t length;
-      };
     };
   };
 
@@ -392,8 +347,7 @@ struct RDMAMsgRTCThread {
   SpinLock m_set_lck_;
   std::thread m_th_;
   std::vector<RDMAConnection *> m_conn_set_;
-  SpinLock m_task_queue_lck_;
-  std::queue<ThreadTaskPack> m_task_queue_;
+  moodycamel::ConcurrentQueue<ThreadTaskPack> m_task_queue_;
   std::unordered_map<uint32_t, RDMAConnection *> m_qp_conn_map_;
 
   std::vector<ThreadTaskPack> m_tps_;

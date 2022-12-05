@@ -73,15 +73,17 @@ int main() {
     delete s;
     return 0u;
   });
+  RDMAConnection::register_rpc_func(5, [](RDMAConnection *conn, void *data, uint32_t size,
+                                          void *resp_data, uint32_t max_resp_data_length,
+                                          void **uctx) {
+    // test end (will throw an error because a thread is not joined)
+    exit(0);
+    return 0;
+  });
 
   RDMAConnection::register_rdma_write_with_imm_handle(
     [](RDMAConnection *conn, uint32_t imm_data, void **uctx) {
       assert(imm_data == 0x123);
-      return 0u;
-    });
-
-    RDMAConnection::register_rdma_send_handle([](RDMAConnection *conn, void *data, uint32_t data_length, void **uctx){
-      assert(data_length == 128);
       return 0u;
     });
 

@@ -1,4 +1,5 @@
 #include "rdma_conn.h"
+#include "moodycamel.h"
 #include <arpa/inet.h>
 #include <netdb.h>
 
@@ -20,41 +21,17 @@ int RDMAConnection::RNR_RETRY_COUNT = 7;
 uint8_t RDMAConnection::INITIATOR_DEPTH = 2;
 int RDMAConnection::RESPONDER_RESOURCES = 2;
 int RDMAConnection::POLL_ENTRY_COUNT = 2;
-uint32_t RDMAConnection::RDMA_TIMEOUT_MS = 2000;
 uint32_t RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 4096;
 uint32_t RDMAConnection::MSG_INLINE_THRESHOLD = 64;
 uint8_t RDMAConnection::MAX_RECVER_THREAD_COUNT = 4;
-uint32_t RDMAConnection::MAX_RECV_BUFFER_SIZE = 1024;
-uint8_t RDMAConnection::MAX_RECV_BUFFER_CNT = 16;
 uint32_t RDMAConnection::MAX_SRQ_WR = 256;
+bool RDMAConnection::RDMA_TIMEOUT_ENABLE = true;
+uint32_t RDMAConnection::RDMA_TIMEOUT_MS = 2000;
 
 std::vector<int16_t> RDMAConnection::VEC_RECVER_THREAD_BIND_CORE;
 
 std::function<void(RDMAConnection *conn)> RDMAConnection::m_hook_connect_;
 std::function<void(RDMAConnection *conn)> RDMAConnection::m_hook_disconnect_;
-
-static RecvBlockInfo alloc_recv_block(RDMAConnection *handler_conn, RDMAConnection *conn) {
-  auto &vec = (*handler_conn->m_recv_block_pool_)[conn->m_pd_];
-  if (vec.empty()) {
-    ibv_mr *mr = conn->register_memory(RDMAConnection::MAX_RECV_BUFFER_SIZE
-                                       * RDMAConnection::MAX_RECV_BUFFER_CNT);
-    MpScRestrictBoundedMemPool<void *> *q =
-      new MpScRestrictBoundedMemPool<void *>(RDMAConnection::MAX_RECV_BUFFER_CNT);
-    for (uint8_t i = 0; i < RDMAConnection::MAX_RECV_BUFFER_CNT; ++i) {
-      q->push((char *)mr->addr + i * RDMAConnection::MAX_RECV_BUFFER_SIZE);
-    }
-
-    return {mr, q};
-  } else {
-    RecvBlockInfo rb = vec.back();
-    vec.pop_back();
-    return rb;
-  }
-}
-static void dealloc_recv_block(RDMAConnection *handler_conn, RecvBlockInfo &&rb) {
-  (*handler_conn->m_recv_block_pool_)[rb.recv_block_mr->pd].emplace_back(
-    std::forward<RecvBlockInfo>(rb));
-}
 
 bool RDMAConnection::m_rdma_conn_param_valid_() {
   ibv_device_attr device_attr;
@@ -71,7 +48,6 @@ bool RDMAConnection::m_rdma_conn_param_valid_() {
          && device_attr.max_qp_rd_atom >= INITIATOR_DEPTH
          && device_attr.max_qp_init_rd_atom >= INITIATOR_DEPTH
          && device_attr.max_mr_size >= MAX_MESSAGE_BUFFER_SIZE + MAX_MESSAGE_BUFFER_SIZE
-         && device_attr.max_mr_size >= MAX_RECV_BUFFER_SIZE * MAX_RECV_BUFFER_CNT
          && device_attr.max_srq_wr >= MAX_SRQ_WR;
 }
 
@@ -164,13 +140,6 @@ RDMAConnection::~RDMAConnection() {
   } break;
   case LISTENER: {
     m_conn_handler_->join();
-    for (auto &p : *m_recv_block_pool_) {
-      for (auto &rb : p.second) {
-        ibv_dereg_mr(rb.recv_block_mr);
-        delete rb.free_recv_block_pool;
-      }
-    }
-    delete m_recv_block_pool_;
   } break;
   }
   rdma_destroy_id(m_cm_id_);
@@ -243,9 +212,10 @@ int RDMAConnection::m_init_ibv_connection_() {
       srq_attr.attr.max_wr = MAX_SRQ_WR;
       srq_attr.attr.max_sge = 1;
       srq_attr.attr.srq_limit = 0;
-      srq_attr.srq_context = (void *)0; // srq context 作为 watermark
 
       ibv_srq *srq = ibv_create_srq(m_pd_, &srq_attr);
+      // full of recv wr
+      m_post_srq_wr(srq, MAX_SRQ_WR);
       it = m_srq_handle_->m_srq_map_.emplace(m_cm_id_->verbs, srq).first;
     }
     m_srq_ = it->second;
@@ -297,8 +267,6 @@ int RDMAConnection::listen(const std::string &ip, uint16_t port) {
     perror("rdma_listen fail");
     return -1;
   }
-
-  m_recv_block_pool_ = new std::map<ibv_pd *, std::vector<RecvBlockInfo>>();
 
   m_conn_handler_ = new std::thread(&RDMAConnection::m_handle_connection_, this);
   if (!m_conn_handler_) {
@@ -476,9 +444,6 @@ void RDMAConnection::m_handle_connection_() {
         m_hook_disconnect_(it->second.first);
       scheduler.unregister_conn_worker(it->second.second, it->second.first);
 
-      dealloc_recv_block(this, {it->second.first->m_recver_.m_recv_block_mr_,
-                                it->second.first->m_recver_.m_free_recv_block_queue_});
-
       delete it->second.first;
       srv_conns.erase(it);
     }
@@ -504,10 +469,6 @@ void RDMAConnection::m_init_connection_(RDMAConnection *init_conn) {
     (char *&)init_conn->m_sender_.m_resp_buf_->addr += MAX_MESSAGE_BUFFER_SIZE;
     memset(init_conn->m_recver_.m_msg_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
     memset(init_conn->m_recver_.m_resp_buf_->addr, 0, MAX_MESSAGE_BUFFER_SIZE);
-
-    RecvBlockInfo rb = alloc_recv_block(this, init_conn);
-    init_conn->m_recver_.m_recv_block_mr_ = rb.recv_block_mr;
-    init_conn->m_recver_.m_free_recv_block_queue_ = rb.free_recv_block_pool;
 
     msg_buf_info.size = MAX_MESSAGE_BUFFER_SIZE;
     msg_buf_info.addr = (uintptr_t)init_conn->m_recver_.m_msg_buf_->addr;
