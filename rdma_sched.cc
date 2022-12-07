@@ -58,9 +58,6 @@ void RDMAThreadScheduler::unregister_conn_worker(rdma_thread_id_t tid, RDMAConne
 }
 void RDMAThreadScheduler::task_dispatch(RDMAMsgRTCThread *rpt,
                                         std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps) {
-  if (tps.empty())
-    return;
-
   // 设置task的同步序号，以备在submit前进行同步排序
   static thread_local task_sync_data_t *default_tsd = alloc_task_sync_data();
   static thread_local uint32_t *seq_ptr = &default_tsd->seq;

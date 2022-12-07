@@ -11,10 +11,7 @@ struct p_data_t {
   uint32_t rkey;
 };
 
-int main(int argc, char **argv) {
-  RDMAEnv::init();
-  RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 64ul << 10;
-
+void testing(int argc, char **argv) {
   RDMAConnection conn;
 
   conn.connect(argv[1], 8765);
@@ -262,13 +259,13 @@ int main(int argc, char **argv) {
   ths.clear();
   {
     // 功能性测试
-    for (int j = 0; j < 1; ++j) {
+    for (int j = 0; j < 4; ++j) {
       ths.emplace_back([&conn, mr, &pdata, tid = j]() {
         RDMABatch b;
         std::vector<const void *> resp_data_ptr;
         srand(tid);
         char rpc_data[128];
-        for (int i = 0; i < 100000; ++i) {
+        for (int i = 0; i < 10000; ++i) {
           int kr = rand() % 4;
           int rpc_cnt = 0;
           for (int k = 0; k < kr; ++k) {
@@ -310,12 +307,25 @@ int main(int argc, char **argv) {
 
     cout << "functional test ok" << endl;
   }
+}
 
-  {
-    // stop server
-    conn.prep_rpc_send(b, 5, nullptr, 0, 0);
-    conn.submit(b);
-  }
+void stop_server(int argc, char **argv) {
+  RDMAConnection conn;
+  conn.connect(argv[1], 8765);
 
+  RDMABatch b;
+  conn.prep_rpc_send(b, 5, nullptr, 0, 0);
+  conn.submit(b);
+}
+
+int main(int argc, char **argv) {
+  RDMAEnv::init();
+  RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 64ul << 10;
+
+  testing(argc, argv);
+  testing(argc, argv);
+  testing(argc, argv);
+
+  stop_server(argc, argv);
   return 0;
 }

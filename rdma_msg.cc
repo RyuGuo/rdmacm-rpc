@@ -1,5 +1,4 @@
 #include "rdma_conn.h"
-#include <infiniband/verbs.h>
 
 struct SyncData {
   volatile bool wc_finish;
@@ -162,20 +161,24 @@ void RDMAMsgRTCThread::thread_routine() {
   RDMABatch void_batch;
   core_bind();
 
-  while (!m_stop_) {
+  while (__glibc_likely(!m_stop_)) {
     m_set_lck_.lock();
     for (auto &conn : m_conn_set_) {
       poll_msg(conn);
+      poll_recv_task(conn);
 
       // 轮询返回值是否发送成功
       // 注：这里仅poll_cq而没有探测msg_mb，无法在用户端实现自动poll_msg
-      conn->m_poll_conn_sd_wr_();
-
-      poll_recv_task(conn);
+      if (conn->m_inflight_count_.load(std::memory_order_relaxed) > 0) {
+        conn->m_poll_conn_sd_wr_();
+      }
     }
 
-    // 将poll msg分发到其他线程执行
-    RDMAThreadScheduler::get_instance().task_dispatch(this, m_tps_);
+    if (!m_tps_.empty()) {
+      // 将poll msg分发到其他线程执行
+      RDMAThreadScheduler::get_instance().task_dispatch(this, m_tps_);
+      m_tps_.clear();
+    }
 
     if (!m_uctx_tps_.empty()) {
       m_task_queue_.enqueue_bulk(m_uctx_tps_.begin(), m_uctx_tps_.size());
@@ -223,7 +226,6 @@ void RDMAMsgRTCThread::thread_routine() {
     }
 
     m_set_lck_.unlock();
-    m_tps_.clear();
   }
 }
 
