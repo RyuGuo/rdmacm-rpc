@@ -2,7 +2,6 @@
 #define __RDMA_CONN_H__
 
 #include <atomic>
-#include <cstdint>
 #include <functional>
 #include <infiniband/verbs.h>
 #include <map>
@@ -11,7 +10,6 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include "moodycamel.h"
 
@@ -20,8 +18,6 @@
 //               L-----> pd  --> mr
 //                        L----> qp
 // 一个rdma_id对应一个qp
-
-using rdma_thread_id_t = uint8_t;
 
 class SpinLock {
 public:
@@ -60,33 +56,12 @@ private:
   int __init__();
 };
 
-struct MsgBlock {
-  uint32_t size;
-  uint32_t prep_resp_size;
-  uint32_t resp_offset;
-  uint16_t rpc_op;
-  bool not_last_end : 1;
-  bool is_buf_last : 1;
-  volatile uint8_t notify : 1;
-  union {
-    uint8_t __padding__[1]; // 如果size=0，作为完成标记
-    char data[0];
-  };
-
-  static uint32_t msg_min_size() { return sizeof(MsgBlock); }
-  uint32_t msg_size() const { return sizeof(MsgBlock) + size; }
-  void set_complete_byte() { data[size] = 1; }
-  bool valid() const { return notify && __atomic_load_n(&data[size], __ATOMIC_RELAXED) == 1; }
-};
+struct MsgBlock;
+struct SyncData;
 
 struct SgeWr {
   ibv_sge sge;
   ibv_send_wr wr;
-};
-
-struct SgeRecvWr {
-  ibv_sge sge;
-  ibv_recv_wr wr;
 };
 
 struct CQHandle {
@@ -95,24 +70,13 @@ struct CQHandle {
   ~CQHandle();
 };
 
-struct SRQHandle {
-  std::map<ibv_context *, ibv_srq *> m_srq_map_;
-  SpinLock m_srq_lck_;
-  ~SRQHandle();
-};
-
-struct RecvBlockInfo {
-  ibv_mr *recv_block_mr;
-  moodycamel::ConcurrentQueue<void *> *free_recv_block_pool;
-};
+struct SRQHandle;
 
 struct RDMABatch {
   std::vector<SgeWr> m_sge_wrs_;
   std::vector<uint32_t> m_msg_offsets_;
   std::vector<MsgBlock *> m_resp_mbs_;
 };
-
-struct SyncData;
 
 struct RDMAFuture {
   int get(std::vector<const void *> &resp_data_ptr);
@@ -160,6 +124,7 @@ struct RDMAConnection {
   ibv_mr *register_memory(void *ptr, size_t size);
   ibv_mr *register_memory(size_t size);
   ibv_mr *register_device_memory(size_t size);
+  void deregister_memory(ibv_mr* mr, bool freed = true);
 
   // prep 操作对于同一个 batch 均为 thread-unsafety
 
@@ -182,7 +147,7 @@ struct RDMAConnection {
    */
   void *prep_rpc_send_defer(RDMABatch &b, uint8_t rpc_op, uint32_t param_data_length,
                             uint32_t resp_data_length);
-  void prep_rpc_send_confirm();
+  void prep_rpc_send_confirm(void *p);
 
   /**
    * 提交prep队列
@@ -239,10 +204,10 @@ struct RDMAConnection {
   };
 
   uint8_t conn_type;
-  volatile bool m_stop_;
-  bool m_rpc_conn_;
-  bool m_atomic_support_;
-  bool m_inline_support_;
+  volatile bool m_stop_ : 1;
+  bool m_rpc_conn_ : 1;
+  bool m_atomic_support_ : 1;
+  bool m_inline_support_ : 1;
   std::atomic<uint32_t> m_inflight_count_ = {0}; // 与 m_sending_lock_ 间隔 >64B
   ibv_comp_channel *m_comp_chan_;
   rdma_cm_id *m_cm_id_;
@@ -254,10 +219,10 @@ struct RDMAConnection {
   CQHandle *m_cq_handle_;
   CQHandle *m_recv_cq_handle_;
   SRQHandle *m_srq_handle_;
+  void *context;
 
   SpinLock m_sending_lock_;
-  RDMABatch m_msg_batch_;
-  std::atomic<uint32_t> m_send_defer_cnt_;
+  moodycamel::ConcurrentQueue<SgeWr> m_msg_batch_;
 
   union {
     //    sender                   // recver
@@ -310,84 +275,13 @@ struct RDMAConnection {
   int m_init_ibv_connection_();
   void m_handle_connection_();
   int m_poll_conn_sd_wr_();
+  void m_init_connection_(RDMAConnection *init_conn);
   uint32_t m_msg_handle_(RDMAConnection *self, MsgBlock *msg_mb, void **uctx);
   static int m_acknowledge_sd_cqe_(int rc, ibv_wc wcs[]);
   static int m_try_poll_resp_(SyncData *sd, std::vector<const void *> &resp_data_ptr);
-  static void m_post_srq_wr(ibv_srq *srq, int count);
-
-  void m_init_connection_(RDMAConnection *init_conn);
-};
-
-struct RDMAMsgRTCThread {
-  struct ThreadTaskPack {
-    enum type_t {
-      MSG,
-      WRITE_IMM,
-    };
-    RDMAConnection *conn;
-    void *uctx;
-    int type;
-    union {
-      struct {
-        MsgBlock *msg_mb;
-        bool is_not_last;
-        uint32_t seq;
-        uint32_t *to_seq_ptr;
-      };
-      struct {
-        void *invalidate_data;
-        uint32_t write_imm_data;
-      };
-    };
-  };
-
-  volatile bool m_stop_;
-  rdma_thread_id_t m_th_id_;
-  int16_t m_core_id_;
-  SpinLock m_set_lck_;
-  std::thread m_th_;
-  std::vector<RDMAConnection *> m_conn_set_;
-  moodycamel::ConcurrentQueue<ThreadTaskPack> m_task_queue_;
-  std::unordered_map<uint32_t, RDMAConnection *> m_qp_conn_map_;
-
-  std::vector<ThreadTaskPack> m_tps_;
-  std::vector<ThreadTaskPack> m_uctx_tps_;
-
-  RDMAMsgRTCThread(rdma_thread_id_t tid);
-  ~RDMAMsgRTCThread();
-  void join_recver_conn(RDMAConnection *conn);
-  void exit_recver_conn(RDMAConnection *conn);
-  void thread_routine();
-  void core_bind();
-  void poll_msg(RDMAConnection *conn);
-  void poll_recv_task(RDMAConnection *represent_conn);
-};
-
-class RDMAThreadScheduler {
-public:
-  static RDMAThreadScheduler &get_instance() {
-    static RDMAThreadScheduler ts;
-    return ts;
-  }
-
-  RDMAThreadScheduler(const RDMAThreadScheduler &) = delete;
-  RDMAThreadScheduler(RDMAThreadScheduler &&) = delete;
-  RDMAThreadScheduler &operator=(const RDMAThreadScheduler &) = delete;
-  RDMAThreadScheduler &operator=(RDMAThreadScheduler &&) = delete;
-
-  rdma_thread_id_t prepick_one_thread();
-  void register_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
-  void unregister_conn_worker(rdma_thread_id_t tid, RDMAConnection *conn);
-  void task_dispatch(RDMAMsgRTCThread *rpt, std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps);
-  void flag_task_done(RDMAMsgRTCThread::ThreadTaskPack &tp);
-
-private:
-  std::vector<RDMAMsgRTCThread *> m_rpt_pool_;
-  // 等待加入的线程队列
-  std::vector<rdma_thread_id_t> m_thread_waiting_pool_;
-
-  RDMAThreadScheduler();
-  ~RDMAThreadScheduler();
+  static void m_post_srq_wr_(ibv_srq *srq, int count);
+  int m_push_msg_wr_(uint64_t local_addr, uint32_t lkey, uint32_t length, uint64_t remote_addr,
+                  uint32_t rkey);
 };
 
 #endif // __RDMA_CONN_H__

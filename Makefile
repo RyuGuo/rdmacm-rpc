@@ -3,7 +3,7 @@ LDLIBS=-lrdmacm -libverbs -lpci -lpthread
 
 all: client server
 
-OBJS=rdma_conn.o rdma_msg.o rdma_sched.o
+OBJS=src/rdma_conn.o src/rdma_msg.o src/rdma_sched.o
 
 client: ${OBJS}
 server: ${OBJS}

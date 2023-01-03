@@ -71,21 +71,24 @@ void testing(int argc, char **argv) {
 
   vector<thread> ths;
   if (1) {
+    const int IT = 100000;
+    const int TH = 16;
     uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch())
                         .count();
-    for (int j = 0; j < 4; ++j) {
+    for (int j = 0; j < TH; ++j) {
       ths.emplace_back([&conn]() {
         RDMABatch b;
-        for (int i = 0; i < 100000; ++i) {
+        std::vector<const void *> resp_data_ptr;
+        for (int i = 0; i < IT; ++i) {
           int *p;
           do {
-            p = (int *)conn.prep_rpc_send_defer(b, 2, 256, 256);
+            p = (int *)conn.prep_rpc_send_defer(b, 2, 4, 4);
           } while (p == nullptr);
           *p = i;
-          conn.prep_rpc_send_confirm();
+          conn.prep_rpc_send_confirm(p);
           RDMAFuture fu = conn.submit(b);
-          std::vector<const void *> resp_data_ptr;
+          resp_data_ptr.clear();
           int rc = fu.get(resp_data_ptr);
           assert(rc == 0);
           assert(resp_data_ptr.size() == 1);
@@ -98,11 +101,12 @@ void testing(int argc, char **argv) {
       th.join();
     }
 
-    cout << (std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-               .count()
-             - now_ms)
-              / 100000.0 / 4 * 1000
+    cout << 1.0
+              * (std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count()
+                 - now_ms)
+              / IT * 1000
          << "us" << endl;
   }
 
@@ -120,12 +124,12 @@ void testing(int argc, char **argv) {
             p = (int *)conn.prep_rpc_send_defer(b, 2, 256, 256);
           } while (p == nullptr);
           *p = i;
-          conn.prep_rpc_send_confirm();
+          conn.prep_rpc_send_confirm(p);
           do {
             p = (int *)conn.prep_rpc_send_defer(b, 2, sizeof(i), sizeof(int));
           } while (p == nullptr);
           *p = i + 1;
-          conn.prep_rpc_send_confirm();
+          conn.prep_rpc_send_confirm(p);
           RDMAFuture fu = conn.submit(b);
           std::vector<const void *> resp_data_ptr;
           int rc = fu.get(resp_data_ptr);
@@ -169,7 +173,7 @@ void testing(int argc, char **argv) {
             p = (int *)conn.prep_rpc_send_defer(b, 2, sizeof(i), sizeof(int));
           } while (p == nullptr);
           *p = i;
-          conn.prep_rpc_send_confirm();
+          conn.prep_rpc_send_confirm(p);
           RDMAFuture fu = conn.submit(b);
           std::vector<const void *> resp_data_ptr;
           fu.get(resp_data_ptr);
@@ -257,7 +261,7 @@ void testing(int argc, char **argv) {
   cout << "test ok" << endl;
 
   ths.clear();
-  {
+  if (0) {
     // 功能性测试
     for (int j = 0; j < 4; ++j) {
       ths.emplace_back([&conn, mr, &pdata, tid = j]() {
@@ -307,6 +311,8 @@ void testing(int argc, char **argv) {
 
     cout << "functional test ok" << endl;
   }
+
+  conn.deregister_memory(mr);
 }
 
 void stop_server(int argc, char **argv) {

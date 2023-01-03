@@ -1,5 +1,4 @@
-#include "rdma_conn.h"
-#include "moodycamel.h"
+#include "common.h"
 #include <arpa/inet.h>
 #include <netdb.h>
 
@@ -10,18 +9,18 @@ struct conn_param_t {
   bool rpc_conn;
 };
 
-int RDMAConnection::MAX_SEND_WR = 32;
+int RDMAConnection::MAX_SEND_WR = 64;
 int RDMAConnection::MAX_RECV_WR = 1;
 int RDMAConnection::MAX_SEND_SGE = 1;
 int RDMAConnection::MAX_RECV_SGE = 1;
-int RDMAConnection::CQE_NUM = 32;
+int RDMAConnection::CQE_NUM = 128;
 int RDMAConnection::RESOLVE_TIMEOUT_MS = 2000;
 uint8_t RDMAConnection::RETRY_COUNT = 7;
 int RDMAConnection::RNR_RETRY_COUNT = 7;
 uint8_t RDMAConnection::INITIATOR_DEPTH = 2;
 int RDMAConnection::RESPONDER_RESOURCES = 2;
-int RDMAConnection::POLL_ENTRY_COUNT = 2;
-uint32_t RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 4096;
+int RDMAConnection::POLL_ENTRY_COUNT = 16;
+uint32_t RDMAConnection::MAX_MESSAGE_BUFFER_SIZE = 1 << 20;
 uint32_t RDMAConnection::MSG_INLINE_THRESHOLD = 64;
 uint8_t RDMAConnection::MAX_RECVER_THREAD_COUNT = 4;
 uint32_t RDMAConnection::MAX_SRQ_WR = 256;
@@ -105,7 +104,7 @@ SRQHandle::~SRQHandle() {
 RDMAConnection::RDMAConnection(CQHandle *cq_handle, bool rpc_conn)
   : m_stop_(false), m_rpc_conn_(rpc_conn), m_cm_id_(nullptr), m_pd_(nullptr), m_recv_cq_(nullptr),
     m_srq_(nullptr), m_dm_(nullptr), m_cq_handle_(cq_handle), m_recv_cq_handle_(nullptr),
-    m_srq_handle_(nullptr), m_conn_handler_(nullptr), m_send_defer_cnt_(0) {
+    m_srq_handle_(nullptr), m_conn_handler_(nullptr) {
 }
 RDMAConnection::~RDMAConnection() {
   m_stop_ = true;
@@ -117,8 +116,7 @@ RDMAConnection::~RDMAConnection() {
       ibv_destroy_cq(m_cq_);
     }
     ibv_destroy_comp_channel(m_comp_chan_);
-    ibv_dereg_mr(m_sender_.m_msg_buf_);
-    free(m_sender_.m_msg_buf_->addr);
+    deregister_memory(m_sender_.m_msg_buf_);
     delete m_sender_.m_resp_buf_;
     if (m_dm_) {
       ibv_free_dm(m_dm_);
@@ -131,8 +129,7 @@ RDMAConnection::~RDMAConnection() {
       ibv_destroy_cq(m_cq_);
     }
     ibv_destroy_comp_channel(m_comp_chan_);
-    ibv_dereg_mr(m_recver_.m_msg_buf_);
-    free(m_recver_.m_msg_buf_->addr);
+    deregister_memory(m_recver_.m_msg_buf_);
     delete m_recver_.m_resp_buf_;
     if (m_dm_) {
       ibv_free_dm(m_dm_);
@@ -215,7 +212,7 @@ int RDMAConnection::m_init_ibv_connection_() {
 
       ibv_srq *srq = ibv_create_srq(m_pd_, &srq_attr);
       // full of recv wr
-      m_post_srq_wr(srq, MAX_SRQ_WR);
+      m_post_srq_wr_(srq, MAX_SRQ_WR);
       it = m_srq_handle_->m_srq_map_.emplace(m_cm_id_->verbs, srq).first;
     }
     m_srq_ = it->second;
@@ -518,6 +515,13 @@ ibv_mr *RDMAConnection::register_memory(void *ptr, size_t size) {
     return nullptr;
   }
   return mr;
+}
+
+void RDMAConnection::deregister_memory(ibv_mr *mr, bool freed) {
+  ibv_dereg_mr(mr);
+  if (freed) {
+    free(mr->addr);
+  }
 }
 
 ibv_mr *RDMAConnection::register_device_memory(size_t size) {

@@ -29,6 +29,7 @@ int main() {
     pdata->addr = (uintptr_t)mr->addr;
     pdata->length = mr->length;
     pdata->rkey = mr->rkey;
+    conn->context = mr;
     return sizeof(*pdata);
   });
   RDMAConnection::register_rpc_func(2, [](RDMAConnection *conn, void *data, uint32_t size,
@@ -77,6 +78,7 @@ int main() {
                                           void *resp_data, uint32_t max_resp_data_length,
                                           void **uctx) {
     // test end (will throw an error because a thread is not joined)
+    conn->deregister_memory((ibv_mr *)conn->context);
     exit(0);
     return 0;
   });

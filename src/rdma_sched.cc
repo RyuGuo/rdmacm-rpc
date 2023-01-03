@@ -1,4 +1,4 @@
-#include "rdma_conn.h"
+#include "common.h"
 #include <random>
 
 struct task_sync_data_t {
@@ -59,6 +59,7 @@ void RDMAThreadScheduler::unregister_conn_worker(rdma_thread_id_t tid, RDMAConne
 void RDMAThreadScheduler::task_dispatch(RDMAMsgRTCThread *rpt,
                                         std::vector<RDMAMsgRTCThread::ThreadTaskPack> &tps) {
   // 设置task的同步序号，以备在submit前进行同步排序
+  static thread_local std::mt19937_64 rng((uintptr_t)rpt);
   static thread_local task_sync_data_t *default_tsd = alloc_task_sync_data();
   static thread_local uint32_t *seq_ptr = &default_tsd->seq;
   static thread_local uint32_t *to_seq_ptr = &default_tsd->to_seq;
@@ -75,8 +76,6 @@ void RDMAThreadScheduler::task_dispatch(RDMAMsgRTCThread *rpt,
       }
     }
   }
-
-  static thread_local std::mt19937_64 rng((uintptr_t)rpt);
 
   // printf("dispatch %luth task to thread %d\n", 0lu, rpt->m_th_id_);
 
